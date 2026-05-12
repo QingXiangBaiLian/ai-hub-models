@@ -140,6 +140,15 @@ class Qwen3_5Base(LLMBase):
     default_user_prompt = "What is gravity? Keep the answer under ten words."
     default_system_prompt = "You are a helpful AI assistant."
 
+    def edit_llm_config(self, llm_config: PretrainedConfig) -> PretrainedConfig:
+        # Force float32 to avoid dtype mismatch in GatedDeltaNet conv1d.
+        # The model config defaults to bfloat16, which causes issues with
+        # conv1d ops in linear attention layers during FP evaluation.
+        llm_config.torch_dtype = torch.float32
+        if hasattr(llm_config, "text_config"):
+            llm_config.text_config.torch_dtype = torch.float32
+        return llm_config
+
     @classmethod
     def get_chat_template(cls) -> dict[str, str]:
         return {
