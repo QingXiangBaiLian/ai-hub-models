@@ -158,7 +158,7 @@ class Qwen3_5_0_8B(Qwen3_5Base):
 
     @staticmethod
     def get_output_names() -> list[str]:
-        return Qwen3_5Base._get_output_names(NUM_LAYERS, LAYER_TYPES)
+        return Qwen3_5Base._get_output_names(NUM_LAYERS, LAYER_TYPES, kv_only=True)
 
     @staticmethod
     def get_input_spec(
@@ -188,6 +188,7 @@ class Qwen3_5_0_8B(Qwen3_5Base):
                 llm_config.get("rope_parameters", {}).get("partial_rotary_factor", 0.25),
             ),
             llm_io_type=llm_io_type,
+            kv_only=True,
         )
 
 
@@ -303,10 +304,26 @@ class Qwen3_5_0_8B_AIMETOnnx(Qwen3_5Base_AIMETOnnx):
         context_length: int = DEFAULT_CONTEXT_LENGTH,
         llm_io_type: LLMIOType = LLMIOType.genie_input_ids,
     ) -> InputSpec:
-        return Qwen3_5_0_8B.get_input_spec(
-            llm_config=llm_config,
+        return Qwen3_5Base._get_input_spec_hybrid(
+            num_hidden_layers=llm_config["num_hidden_layers"],
             sequence_length=sequence_length,
             context_length=context_length,
+            hidden_size=llm_config["hidden_size"],
+            num_key_value_heads=llm_config["num_key_value_heads"],
+            num_attention_heads=llm_config["num_attention_heads"],
+            head_dim=llm_config.get("head_dim", HEAD_DIM),
+            layer_types=LAYER_TYPES,
+            linear_attn_config={
+                "linear_conv_kernel_dim": llm_config.get("linear_conv_kernel_dim", 4),
+                "linear_key_head_dim": llm_config.get("linear_key_head_dim", 128),
+                "linear_value_head_dim": llm_config.get("linear_value_head_dim", 128),
+                "linear_num_key_heads": llm_config.get("linear_num_key_heads", 16),
+                "linear_num_value_heads": llm_config.get("linear_num_value_heads", 16),
+            },
+            partial_rotary_factor=llm_config.get(
+                "partial_rotary_factor",
+                llm_config.get("rope_parameters", {}).get("partial_rotary_factor", 0.25),
+            ),
             llm_io_type=llm_io_type,
         )
 
@@ -318,4 +335,4 @@ class Qwen3_5_0_8B_QNN(Qwen3_5Base_QNN):
     def get_output_names() -> list[str]:
         return Qwen3_5Base._get_output_names(NUM_LAYERS, LAYER_TYPES)
 
-    get_input_spec = staticmethod(Qwen3_5_0_8B.get_input_spec)
+    get_input_spec = staticmethod(Qwen3_5_0_8B_AIMETOnnx.get_input_spec)

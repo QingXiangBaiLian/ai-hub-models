@@ -237,9 +237,15 @@ class Qwen3_5Base(LLMBase):
         """
         Forward pass for hybrid Qwen3.5 model with both attention and linear layers.
 
-        The state tensors in *rest are ordered by layer index:
-        - For full_attention layers: (past_key_i, past_value_i)
-        - For linear_attention layers: (conv_state_i, recurrent_state_i)
+        Supports two modes based on the number of state tensors provided:
+
+        1. **KV-only mode** (FP eval via generator): state tensors contain only
+           KV cache for full_attention layers. Linear attention state is managed
+           internally. Outputs only KV cache for full_attention layers.
+
+        2. **Hybrid mode** (ONNX export): state tensors contain entries for ALL
+           layers (KV cache for full_attention, conv/recurrent for linear_attention).
+           Outputs state for all layers.
         """
         # Unpack position embeddings
         if self.llm_io_type == LLMIOType.huggingface_input_ids:
@@ -251,31 +257,83 @@ class Qwen3_5Base(LLMBase):
 
         layer_types = self._get_layer_types()
         text_config = self._get_text_config()
+        linear_attn_config = self._get_linear_attn_config()
+
+        num_full_attention = sum(1 for lt in layer_types if lt == "full_attention")
+        num_all_layers = len(layer_types)
+
+        # Detect mode: KV-only (generator) vs hybrid (ONNX export)
+        kv_only_mode = len(state_tensors) == num_full_attention * 2
+        hybrid_mode = len(state_tensors) == num_all_layers * 2
+
+        if not kv_only_mode and not hybrid_mode:
+            raise ValueError(
+                f"Expected {num_full_attention * 2} (KV-only) or "
+                f"{num_all_layers * 2} (hybrid) state tensors, "
+                f"got {len(state_tensors)}."
+            )
 
         # Build DynamicCache with proper layer structure
         cache = DynamicCache(config=text_config)
 
         # Pre-populate cache with input state
         tensor_idx = 0
+        kv_tensor_idx = 0
         for layer_idx, layer_type in enumerate(layer_types):
             if layer_type == "full_attention":
                 # KV cache: past_key shape (num_kv_heads, 1, head_dim, cache_len)
                 #           past_value shape (num_kv_heads, 1, cache_len, head_dim)
-                past_key = state_tensors[tensor_idx]  # (num_kv_heads, 1, head_dim, cache_len)
-                past_value = state_tensors[tensor_idx + 1]  # (num_kv_heads, 1, cache_len, head_dim)
+                if kv_only_mode:
+                    past_key = state_tensors[kv_tensor_idx]
+                    past_value = state_tensors[kv_tensor_idx + 1]
+                    kv_tensor_idx += 2
+                else:
+                    past_key = state_tensors[tensor_idx]
+                    past_value = state_tensors[tensor_idx + 1]
+                    tensor_idx += 2
 
                 # Convert from SHA format to standard HF format:
                 # (num_kv_heads, 1, head_dim, cache_len) -> (1, num_kv_heads, cache_len, head_dim)
-                k = past_key.permute(1, 0, 3, 2)  # (1, num_kv_heads, cache_len, head_dim)
-                v = past_value.permute(1, 0, 2, 3)  # (1, num_kv_heads, cache_len, head_dim)
+                k = past_key.permute(1, 0, 3, 2)
+                v = past_value.permute(1, 0, 2, 3)
                 cache.update(k, v, layer_idx)
             else:
-                # Linear attention: conv_state and recurrent_state
-                conv_state = state_tensors[tensor_idx]
-                recurrent_state = state_tensors[tensor_idx + 1]
+                if hybrid_mode:
+                    # Linear attention: conv_state and recurrent_state
+                    conv_state = state_tensors[tensor_idx]
+                    recurrent_state = state_tensors[tensor_idx + 1]
+                    tensor_idx += 2
+                else:
+                    # KV-only mode: use internally saved state or zeros
+                    if hasattr(self, "_linear_attn_cache") and layer_idx in self._linear_attn_cache:
+                        conv_state, recurrent_state = self._linear_attn_cache[layer_idx]
+                    else:
+                        conv_kernel_dim = linear_attn_config["linear_conv_kernel_dim"]
+                        key_dim = (
+                            linear_attn_config["linear_num_key_heads"]
+                            * linear_attn_config["linear_key_head_dim"]
+                        )
+                        value_dim = (
+                            linear_attn_config["linear_num_value_heads"]
+                            * linear_attn_config["linear_value_head_dim"]
+                        )
+                        conv_dim = key_dim * 2 + value_dim
+                        num_v_heads = linear_attn_config["linear_num_value_heads"]
+                        k_head_dim = linear_attn_config["linear_key_head_dim"]
+                        v_head_dim = linear_attn_config["linear_value_head_dim"]
+
+                        conv_state = torch.zeros(
+                            1, conv_dim, conv_kernel_dim - 1,
+                            device=input_tokens.device,
+                            dtype=torch.float32,
+                        )
+                        recurrent_state = torch.zeros(
+                            1, num_v_heads, k_head_dim, v_head_dim,
+                            device=input_tokens.device,
+                            dtype=torch.float32,
+                        )
                 cache.update_conv_state(conv_state, layer_idx)
                 cache.update_recurrent_state(recurrent_state, layer_idx)
-            tensor_idx += 2
 
         # Run model
         model_kwargs: dict[str, Any] = {
@@ -289,6 +347,11 @@ class Qwen3_5Base(LLMBase):
         # Extract output states
         out_cache = out["past_key_values"]
         flat_output_states: list[torch.Tensor] = []
+
+        # Save linear attention state internally for KV-only mode
+        if kv_only_mode:
+            if not hasattr(self, "_linear_attn_cache"):
+                self._linear_attn_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
         for layer_idx, layer_type in enumerate(layer_types):
             if layer_type == "full_attention":
@@ -311,8 +374,16 @@ class Qwen3_5Base(LLMBase):
                 layer_cache = out_cache.layers[layer_idx]
                 conv_state_out = layer_cache.conv_states
                 recurrent_state_out = layer_cache.recurrent_states
-                flat_output_states.append(conv_state_out)
-                flat_output_states.append(recurrent_state_out)
+
+                if kv_only_mode:
+                    # Save internally, don't include in output
+                    self._linear_attn_cache[layer_idx] = (
+                        conv_state_out.detach(),
+                        recurrent_state_out.detach(),
+                    )
+                else:
+                    flat_output_states.append(conv_state_out)
+                    flat_output_states.append(recurrent_state_out)
 
         return [out["logits"], *flat_output_states]
 
@@ -320,12 +391,15 @@ class Qwen3_5Base(LLMBase):
     def _get_output_names(
         num_hidden_layers: int,
         layer_types: list[str] | None = None,
+        kv_only: bool = False,
     ) -> list[str]:
         """
         Generate output names for the hybrid model.
 
         For full_attention layers: past_key_{i}_out, past_value_{i}_out
         For linear_attention layers: conv_state_{i}_out, recurrent_state_{i}_out
+
+        If kv_only=True, only include outputs for full_attention layers (for FP eval).
         """
         output_names = ["logits"]
         if layer_types is None:
@@ -334,7 +408,7 @@ class Qwen3_5Base(LLMBase):
             if layer_type == "full_attention":
                 output_names.append(f"past_key_{i}_out")
                 output_names.append(f"past_value_{i}_out")
-            else:
+            elif not kv_only:
                 output_names.append(f"conv_state_{i}_out")
                 output_names.append(f"recurrent_state_{i}_out")
         return output_names
@@ -352,9 +426,13 @@ class Qwen3_5Base(LLMBase):
         linear_attn_config: dict[str, int],
         partial_rotary_factor: float = 0.25,
         llm_io_type: LLMIOType = LLMIOType.genie_input_ids,
+        kv_only: bool = False,
     ) -> InputSpec:
         """
         Build input spec for hybrid model with both full_attention and linear_attention layers.
+
+        If kv_only=True, only include KV cache entries for full_attention layers (for FP eval).
+        Linear attention state is managed internally by the model in that case.
         """
         rotary_dim = int(head_dim * partial_rotary_factor)
         embed_dim = rotary_dim // 2
@@ -411,8 +489,8 @@ class Qwen3_5Base(LLMBase):
                     (num_key_value_heads, 1, context_length - sequence_length, head_dim),
                     "float32",
                 )
-            else:
-                # GatedDeltaNet state
+            elif not kv_only:
+                # GatedDeltaNet state (only for ONNX export, not FP eval)
                 input_spec[f"conv_state_{i}_in"] = (
                     (1, conv_dim, conv_kernel_dim - 1),
                     "float32",
