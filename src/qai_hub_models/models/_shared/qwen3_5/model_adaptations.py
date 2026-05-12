@@ -268,11 +268,12 @@ class SHAQwen3_5Attention(Qwen3_5Attention):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_value: Cache | None = None,
+        past_key_values: Cache | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: torch.LongTensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         bsz, q_len, _ = hidden_states.size()
         hidden_size = self.config.hidden_size
@@ -284,6 +285,9 @@ class SHAQwen3_5Attention(Qwen3_5Attention):
             "partial_rotary_factor", 1.0
         )
         rotary_dim = int(self.head_dim * partial_rotary_factor)
+
+        # Use past_key_values as the cache variable
+        past_key_value = past_key_values
 
         if TORCH_SUPPORTS_DYNAMIC_SHAPE:
             hidden_states = hidden_states.unsqueeze(2)
