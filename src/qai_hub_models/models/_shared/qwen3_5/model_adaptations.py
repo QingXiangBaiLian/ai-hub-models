@@ -315,8 +315,6 @@ class SHAQwen3_5Attention(Qwen3_5Attention):
         ]
 
         kv_seq_len = value_states[0].shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value.value_cache[self.layer_idx][0].shape[-2]  # type: ignore[attr-defined, unused-ignore]
 
         assert position_embeddings is not None
         # Apply partial rotary embeddings
@@ -330,31 +328,33 @@ class SHAQwen3_5Attention(Qwen3_5Attention):
         ]
 
         if past_key_value is not None:
-            past_key = past_key_value.key_cache[self.layer_idx]  # type: ignore[attr-defined, unused-ignore]
-            past_value = past_key_value.value_cache[self.layer_idx]  # type: ignore[attr-defined, unused-ignore]
-
             transposed_key_states = [
                 key_state.transpose(2, 3) for key_state in key_states
             ]
 
+            # Stack per-head lists into single tensors for cache storage.
+            # keys: list of (B, 1, head_dim, seq) -> (B, KV_heads, seq, head_dim)
+            stacked_keys = torch.cat(transposed_key_states, dim=1).transpose(-1, -2)
+            # values: list of (B, 1, seq, head_dim) -> (B, KV_heads, seq, head_dim)
+            stacked_values = torch.cat(value_states, dim=1)
+
             cos, sin = position_embeddings
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            past_key_value.update(
-                transposed_key_states,  # type: ignore[arg-type, unused-ignore]
-                value_states,  # type: ignore[arg-type, unused-ignore]
+            # update() stores new KV, concatenates with any existing cache,
+            # and returns the full accumulated tensors.
+            full_keys, full_values = past_key_value.update(
+                stacked_keys,
+                stacked_values,
                 self.layer_idx,
                 cache_kwargs,
             )
 
-            # Concatenate with past KV
-            key_states = [
-                torch.cat([pk, k.transpose(2, 3)], dim=3)
-                for pk, k in zip(past_key, key_states, strict=False)
-            ]
-            value_states = [
-                torch.cat([pv, v], dim=2)
-                for pv, v in zip(past_value, value_states, strict=False)
-            ]
+            # Unpack accumulated cache back to per-head lists.
+            # full_keys: (B, KV_heads, total_seq, head_dim) -> transpose + split
+            key_states = list(full_keys.transpose(-1, -2).split(1, dim=1))
+            # full_values: (B, KV_heads, total_seq, head_dim) -> split
+            value_states = list(full_values.split(1, dim=1))
+            kv_seq_len = full_values.shape[-2]
         else:
             key_states = [
                 key_state.transpose(2, 3) for key_state in key_states

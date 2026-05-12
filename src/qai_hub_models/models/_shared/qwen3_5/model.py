@@ -203,9 +203,15 @@ class Qwen3_5Base(LLMBase):
         modeling_qwen3_5.Qwen3_5TextModel.forward = patched_qwen3_5_text_model_forward  # type: ignore[assignment, unused-ignore]
 
     def _verify_ckpt(self) -> None:
+        # llm_config may be the text_config (extracted by get_llm_config),
+        # which can have architectures=None and model_type="qwen3_5_text".
+        architectures = getattr(self.llm_config, "architectures", None) or []
+        arch_ok = len(architectures) == 0 or any(
+            arch in ("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration")
+            for arch in architectures
+        )
         if not (
-            self.llm_config.architectures[0]  # type: ignore[index, unused-ignore]
-            in ("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration")
+            arch_ok
             and self.llm_config.model_type in ("qwen3_5_text", "qwen3_5")
         ):
             raise ValueError(
@@ -369,8 +375,8 @@ class Qwen3_5Base(LLMBase):
                     keys = out_cache.key_cache[layer_idx]
                     values = out_cache.value_cache[layer_idx]
                 else:
-                    keys = out_cache.layers[layer_idx].key_cache
-                    values = out_cache.layers[layer_idx].value_cache
+                    keys = out_cache.layers[layer_idx].keys
+                    values = out_cache.layers[layer_idx].values
 
                 # Convert to SHA output format:
                 # (1, num_kv_heads, seq_len, head_dim) -> (num_kv_heads, 1, head_dim, seq_len)
