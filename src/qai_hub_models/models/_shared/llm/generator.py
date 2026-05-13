@@ -32,6 +32,16 @@ if TYPE_CHECKING:
     from PIL import Image
 
 
+def _dynamic_cache_to_legacy_list(cache: DynamicCache) -> list[torch.Tensor]:
+    if hasattr(cache, "to_legacy_cache"):
+        return list(itertools.chain.from_iterable(cache.to_legacy_cache()))
+    return list(
+        itertools.chain.from_iterable(
+            (layer.keys, layer.values) for layer in cache.layers
+        )
+    )
+
+
 def get_past_keyval_with_shift(
     past_key_vals: list[torch.Tensor],
     new_key_vals: list[torch.Tensor],
@@ -420,16 +430,12 @@ class LLM_Generator(GenerationMixin, torch.nn.Module):
                 0
                 if len(past_key_values.value_cache) == 0
                 or past_key_values.value_cache[0] == []
-                else past_key_values.value_cache[0].shape[-2]
+                else past_key_values.value_cache[0][0].shape[-1]
             )
-        elif past_key_values.layers and hasattr(past_key_values.layers[0], "values"):  # type: ignore[attr-defined, unused-ignore]
-            num_processed_tokens = (
-                0
-                if past_key_values.layers[0].values is None  # type: ignore[attr-defined, unused-ignore]
-                else past_key_values.layers[0].values.shape[-2]  # type: ignore[attr-defined, unused-ignore]
-            )
+        elif hasattr(past_key_values, "layers"):
+            num_processed_tokens = past_key_values.get_seq_length()
         else:
-            raise ValueError("Unsupported KV cache type")
+            raise ValueError(f"Unsupported KV cache type: {type(past_key_values)}")
 
         inputs: dict[str, torch.Tensor | DynamicCache | None] = {}
         if inputs_embeds is not None and num_processed_tokens < inputs_embeds.shape[1]:
@@ -712,9 +718,7 @@ class LLM_Generator(GenerationMixin, torch.nn.Module):
             "past_key_values": (
                 []
                 if past_key_values is None or past_key_values.get_seq_length() == 0
-                else list(
-                    itertools.chain.from_iterable(past_key_values.to_legacy_cache())
-                )
+                else _dynamic_cache_to_legacy_list(past_key_values)
             )
         }
 
@@ -805,9 +809,7 @@ class LLM_Generator(GenerationMixin, torch.nn.Module):
             "past_key_values": (
                 []
                 if past_key_values is None or past_key_values.get_seq_length() == 0
-                else list(
-                    itertools.chain.from_iterable(past_key_values.to_legacy_cache())
-                )
+                else _dynamic_cache_to_legacy_list(past_key_values)
             )
         }
 

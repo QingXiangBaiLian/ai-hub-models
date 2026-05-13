@@ -33,11 +33,13 @@ if TYPE_CHECKING:
 import qai_hub as hub
 from packaging.version import Version
 from transformers import PretrainedConfig, PreTrainedTokenizer
-from transformers.cache_utils import DynamicCache
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.models.qwen3_5 import modeling_qwen3_5
 
 from qai_hub_models.models._shared.llm.common import LLMIOType
+from qai_hub_models.models._shared.llm.sha_dynamic_kvcache import (
+    SHADynamicCacheNewValueOnly,
+)
 from qai_hub_models.models._shared.qwen3_5.model_adaptations import (
     QcQwen3_5_apply_rotary_pos_emb,
     QCQwen3_5ForCausalLM,
@@ -140,6 +142,15 @@ class Qwen3_5Base(LLMBase):
     default_user_prompt = "What is gravity? Keep the answer under ten words."
     default_system_prompt = "You are a helpful AI assistant."
 
+    def edit_llm_config(self, llm_config: PretrainedConfig) -> PretrainedConfig:
+        # Force float32 to avoid dtype mismatch in GatedDeltaNet conv1d.
+        # The model config defaults to bfloat16, which causes issues with
+        # conv1d ops in linear attention layers during FP evaluation.
+        llm_config.torch_dtype = torch.float32
+        if hasattr(llm_config, "text_config"):
+            llm_config.text_config.torch_dtype = torch.float32
+        return llm_config
+
     @classmethod
     def get_chat_template(cls) -> dict[str, str]:
         return {
@@ -194,14 +205,27 @@ class Qwen3_5Base(LLMBase):
         modeling_qwen3_5.Qwen3_5TextModel.forward = patched_qwen3_5_text_model_forward  # type: ignore[assignment, unused-ignore]
 
     def _verify_ckpt(self) -> None:
-        if not (
-            self.llm_config.architectures[0]  # type: ignore[index, unused-ignore]
-            in ("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration")
-            and self.llm_config.model_type in ("qwen3_5_text", "qwen3_5")
+        if self.llm_config.model_type not in ("qwen3_5_text", "qwen3_5"):
+            raise ValueError(
+                "Model config is not compatible with this model implementation."
+            )
+        architectures = self.llm_config.architectures
+        if architectures is not None and architectures[0] not in (
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5ForConditionalGeneration",
         ):
             raise ValueError(
                 "Model config is not compatible with this model implementation."
             )
+    #def _verify_ckpt(self) -> None:
+    #    if not (
+    #        self.llm_config.architectures[0]  # type: ignore[index, unused-ignore]
+    #        in ("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration")
+    #        and self.llm_config.model_type in ("qwen3_5_text", "qwen3_5")
+    #    ):
+    #        raise ValueError(
+    #            "Model config is not compatible with this model implementation."
+    #        )
 
     def _get_layer_types(self) -> list[str]:
         """Get the layer types from config."""
@@ -274,7 +298,7 @@ class Qwen3_5Base(LLMBase):
             )
 
         # Build DynamicCache with proper layer structure
-        cache = DynamicCache(config=text_config)
+        cache = SHADynamicCacheNewValueOnly(config=text_config)
 
         # Pre-populate cache with input state
         tensor_idx = 0
@@ -360,8 +384,8 @@ class Qwen3_5Base(LLMBase):
                     keys = out_cache.key_cache[layer_idx]
                     values = out_cache.value_cache[layer_idx]
                 else:
-                    keys = out_cache.layers[layer_idx].key_cache
-                    values = out_cache.layers[layer_idx].value_cache
+                    keys = out_cache.layers[layer_idx].keys
+                    values = out_cache.layers[layer_idx].values
 
                 # Convert to SHA output format:
                 # (1, num_kv_heads, seq_len, head_dim) -> (num_kv_heads, 1, head_dim, seq_len)
@@ -371,9 +395,13 @@ class Qwen3_5Base(LLMBase):
                 flat_output_states.append(v_out)
             else:
                 # Extract linear attention state
-                layer_cache = out_cache.layers[layer_idx]
-                conv_state_out = layer_cache.conv_states
-                recurrent_state_out = layer_cache.recurrent_states
+                if hasattr(out_cache, "conv_states"):
+                    conv_state_out = out_cache.conv_states[layer_idx]
+                    recurrent_state_out = out_cache.recurrent_states[layer_idx]
+                else:
+                    layer_cache = out_cache.layers[layer_idx]
+                    conv_state_out = layer_cache.conv_states
+                    recurrent_state_out = layer_cache.recurrent_states
 
                 if kv_only_mode:
                     # Save internally, don't include in output

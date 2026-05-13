@@ -28,6 +28,9 @@ from qai_hub_models.models._shared.llm.model_adaptations import (
     ConvInplaceLinear,
     repeat_kv,
 )
+from qai_hub_models.models._shared.llm.sha_dynamic_kvcache import (
+    SHADynamicCacheNewValueOnly,
+)
 
 
 def _apply_rope_single_partial(
@@ -268,11 +271,12 @@ class SHAQwen3_5Attention(Qwen3_5Attention):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_value: Cache | None = None,
+        past_key_values: Cache | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: torch.LongTensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         bsz, q_len, _ = hidden_states.size()
         hidden_size = self.config.hidden_size
@@ -311,8 +315,8 @@ class SHAQwen3_5Attention(Qwen3_5Attention):
         ]
 
         kv_seq_len = value_states[0].shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value.value_cache[self.layer_idx][0].shape[-2]  # type: ignore[attr-defined, unused-ignore]
+        if past_key_values is not None:
+            kv_seq_len += past_key_values.layers[self.layer_idx].values.shape[-2]
 
         assert position_embeddings is not None
         # Apply partial rotary embeddings
@@ -325,31 +329,29 @@ class SHAQwen3_5Attention(Qwen3_5Attention):
             for k in key_states
         ]
 
-        if past_key_value is not None:
-            past_key = past_key_value.key_cache[self.layer_idx]  # type: ignore[attr-defined, unused-ignore]
-            past_value = past_key_value.value_cache[self.layer_idx]  # type: ignore[attr-defined, unused-ignore]
-
+        if past_key_values is not None:
             transposed_key_states = [
                 key_state.transpose(2, 3) for key_state in key_states
             ]
 
             cos, sin = position_embeddings
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            past_key_value.update(
-                transposed_key_states,  # type: ignore[arg-type, unused-ignore]
-                value_states,  # type: ignore[arg-type, unused-ignore]
+            past_key_values.update(
+                torch.cat(key_states, dim=1),
+                torch.cat(value_states, dim=1),
                 self.layer_idx,
                 cache_kwargs,
             )
 
-            # Concatenate with past KV
+            past_key = past_key_values.layers[self.layer_idx].keys
+            past_value = past_key_values.layers[self.layer_idx].values
             key_states = [
-                torch.cat([pk, k.transpose(2, 3)], dim=3)
-                for pk, k in zip(past_key, key_states, strict=False)
+                past_key[:, i, :, :].unsqueeze(1).transpose(2, 3)
+                for i in range(past_key.shape[1])
             ]
             value_states = [
-                torch.cat([pv, v], dim=2)
-                for pv, v in zip(past_value, value_states, strict=False)
+                past_value[:, i, :, :].unsqueeze(1)
+                for i in range(past_value.shape[1])
             ]
         else:
             key_states = [
@@ -559,7 +561,7 @@ def patched_qwen3_5_text_model_forward(
         inputs_embeds = self.embed_tokens(input_ids)
 
     if use_cache and past_key_values is None:
-        past_key_values = DynamicCache(config=self.config)
+        past_key_values = SHADynamicCacheNewValueOnly(config=self.config)
 
     # Detect if position_ids is already pre-computed (cos, sin) tuple
     if isinstance(position_ids, (tuple, list)) and len(position_ids) == 2:

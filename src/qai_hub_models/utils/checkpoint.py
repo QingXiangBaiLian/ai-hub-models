@@ -120,6 +120,12 @@ class CheckpointType(Enum):
         ).is_file():
             return CheckpointType.HF_LOCAL
 
+        # Standard HuggingFace model directory (config.json + *.safetensors)
+        if (cp_path / "config.json").is_file() and list(
+            cp_path.glob("*.safetensors*")
+        ):
+            return CheckpointType.HF_LOCAL
+
         # Aimet ONNX export (ONNX + encodings)
         if cp_path.glob("model*.onnx") and (cp_path / "model.encodings").is_file():
             return CheckpointType.AIMET_ONNX_EXPORT
