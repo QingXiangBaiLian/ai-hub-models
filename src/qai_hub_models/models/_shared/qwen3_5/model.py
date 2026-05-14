@@ -288,6 +288,12 @@ class Qwen3_5Base(LLMBase):
                 f"got {len(state_tensors)}."
             )
 
+        # In KV-only mode, detect fresh sequence start (all-zero KV) and
+        # reset linear attention cache to prevent state leaking between samples.
+        if kv_only_mode and hasattr(self, "_linear_attn_cache"):
+            if state_tensors[0].abs().sum() == 0:
+                self._linear_attn_cache.clear()
+
         # Build DynamicCache with proper layer structure
         cache = DynamicCache(config=text_config)
 

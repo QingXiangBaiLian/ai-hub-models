@@ -32,6 +32,18 @@ if TYPE_CHECKING:
     from PIL import Image
 
 
+def _dynamic_cache_to_flat_list(cache: DynamicCache) -> list[torch.Tensor]:
+    """Convert a DynamicCache to a flat list of [key, value, key, value, ...]."""
+    if hasattr(cache, "to_legacy_cache"):
+        return list(itertools.chain.from_iterable(cache.to_legacy_cache()))
+    # transformers 5.x: layers API
+    result: list[torch.Tensor] = []
+    for layer in cache.layers:
+        result.append(layer.keys)  # type: ignore[attr-defined, unused-ignore]
+        result.append(layer.values)  # type: ignore[attr-defined, unused-ignore]
+    return result
+
+
 def get_past_keyval_with_shift(
     past_key_vals: list[torch.Tensor],
     new_key_vals: list[torch.Tensor],
@@ -422,12 +434,15 @@ class LLM_Generator(GenerationMixin, torch.nn.Module):
                 or past_key_values.value_cache[0] == []
                 else past_key_values.value_cache[0].shape[-2]
             )
-        elif past_key_values.layers and hasattr(past_key_values.layers[0], "values"):  # type: ignore[attr-defined, unused-ignore]
-            num_processed_tokens = (
-                0
-                if past_key_values.layers[0].values is None  # type: ignore[attr-defined, unused-ignore]
-                else past_key_values.layers[0].values.shape[-2]  # type: ignore[attr-defined, unused-ignore]
-            )
+        elif hasattr(past_key_values, "layers"):
+            if past_key_values.layers and hasattr(past_key_values.layers[0], "values"):  # type: ignore[attr-defined, unused-ignore]
+                num_processed_tokens = (
+                    0
+                    if past_key_values.layers[0].values is None  # type: ignore[attr-defined, unused-ignore]
+                    else past_key_values.layers[0].values.shape[-2]  # type: ignore[attr-defined, unused-ignore]
+                )
+            else:
+                num_processed_tokens = 0
         else:
             raise ValueError("Unsupported KV cache type")
 
@@ -468,6 +483,11 @@ class LLM_Generator(GenerationMixin, torch.nn.Module):
         print(
             f"Switching from sequence_length={self.selected_model.sequence_length} to sequence_length={new_selected_model.sequence_length}"
         )
+
+        # Transfer persistent state (e.g. linear attention cache) before release
+        old_model = self.selected_model
+        _linear_attn_cache = getattr(old_model, "_linear_attn_cache", None)
+
         # release the model to preserve memory
         if isinstance(self.selected_model, (LLM_Loader, LLM_AIMETOnnx, LLM_QNN)):
             self.selected_model.release()
@@ -477,6 +497,11 @@ class LLM_Generator(GenerationMixin, torch.nn.Module):
             if isinstance(new_selected_model, LLM_Loader)
             else new_selected_model
         )
+
+        # Restore persistent state on the new model
+        if _linear_attn_cache is not None:
+            self.selected_model._linear_attn_cache = _linear_attn_cache
+
         return self.selected_model
 
     @staticmethod
@@ -712,9 +737,7 @@ class LLM_Generator(GenerationMixin, torch.nn.Module):
             "past_key_values": (
                 []
                 if past_key_values is None or past_key_values.get_seq_length() == 0
-                else list(
-                    itertools.chain.from_iterable(past_key_values.to_legacy_cache())
-                )
+                else _dynamic_cache_to_flat_list(past_key_values)
             )
         }
 
@@ -805,9 +828,7 @@ class LLM_Generator(GenerationMixin, torch.nn.Module):
             "past_key_values": (
                 []
                 if past_key_values is None or past_key_values.get_seq_length() == 0
-                else list(
-                    itertools.chain.from_iterable(past_key_values.to_legacy_cache())
-                )
+                else _dynamic_cache_to_flat_list(past_key_values)
             )
         }
 
