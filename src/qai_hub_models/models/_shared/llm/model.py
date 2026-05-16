@@ -385,7 +385,7 @@ def get_onnx_model(
             extra = {
                 "opset_version": 18,
                 "dynamo": True,
-                "optimize": True,
+                "optimize": False,
                 "dynamic_shapes": dynamic_shapes,
             }
         else:
@@ -409,19 +409,52 @@ def get_onnx_model(
         fp_model.to(old_device)
 
         onnx_model = onnx.load(path)
-        # Clean up multiple weights files
-        for file in glob.glob(os.path.join(os.path.dirname(path), "*.weight")):
-            os.remove(file)
-        for file in glob.glob(os.path.join(os.path.dirname(path), "onnx__*")):
-            os.remove(file)
 
-        onnx.save_model(
-            onnx_model,
-            path,
-            save_as_external_data=True,
-            all_tensors_to_one_file=True,
-            location="model.data",
-        )
+        # Normalize the ONNX graph for onnxruntime compatibility
+        # (the onnxscript optimizer hangs on hybrid attention models, so we
+        # run only inline + structural cleanup via IR)
+        if use_dynamic_shapes:
+            import onnx_ir
+            from onnx_ir import passes as ir_passes
+            from onnxscript.optimizer import common_passes
+
+            ir_model = onnx_ir.from_proto(onnx_model)
+            del onnx_model
+
+            targeted_passes = ir_passes.Sequential(
+                common_passes.InlinePass(),
+                common_passes.RemoveUnusedNodesPass(),
+                common_passes.RemoveUnusedFunctionsPass(),
+                common_passes.RemoveUnusedOpsetsPass(),
+                common_passes.LiftConstantsToInitializersPass(
+                    lift_all_constants=True, size_limit=0
+                ),
+                common_passes.LiftSubgraphInitializersToMainGraphPass(),
+                common_passes.DeduplicateInitializersPass(),
+                common_passes.OutputFixPass(),
+                common_passes.NameFixPass(),
+            )
+            targeted_passes(ir_model)
+            onnx_model = onnx_ir.to_proto(ir_model)
+            del ir_model
+        else:
+            # Clean up multiple weights files
+            for file in glob.glob(
+                os.path.join(os.path.dirname(path), "*.weight")
+            ):
+                os.remove(file)
+            for file in glob.glob(
+                os.path.join(os.path.dirname(path), "onnx__*")
+            ):
+                os.remove(file)
+
+            onnx.save_model(
+                onnx_model,
+                path,
+                save_as_external_data=True,
+                all_tensors_to_one_file=True,
+                location="model.data",
+            )
 
     finally:
         if already_has_data:
@@ -1902,13 +1935,40 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
 
         AimetLogger.set_level_for_all_areas(logging.WARNING)
         default_config = get_aimet_config_path("default_config_llama")
+
+        # Map undefined tensor type (0) to float16 so AIMET's
+        # _infer_activation_dtypes doesn't crash on dynamo-exported models
+        # where shape inference can't resolve all intermediate types
+        if 0 not in onnx.mapping.TENSOR_TYPE_MAP:
+            onnx.mapping.TENSOR_TYPE_MAP[0] = onnx.mapping.TENSOR_TYPE_MAP[
+                onnx.TensorProto.FLOAT16
+            ]
+
         # Tie Quantizers for Concat Op
         quantsim.op_types_to_tie_qtzrs = ["Concat"]
         quantsim._tie_qtzrs = True
         # Ignore Slice and Constant outputs
         quantsim.op_outputs_to_ignore.append("Slice")
         quantsim.op_outputs_to_ignore.append("Constant")
+        # Ignore sequence-producing ops (dynamo export without full optimization)
+        quantsim.op_outputs_to_ignore.append("SplitToSequence")
+        quantsim.op_outputs_to_ignore.append("SequenceAt")
+        quantsim.op_outputs_to_ignore.append("SequenceConstruct")
         qs.encoding_version = "1.0.0"
+
+        # Ensure opset_import is present (dynamo export with optimize=False
+        # may omit it, causing onnxruntime to reject the model)
+        has_default_opset = any(
+            op.domain == "" and op.version > 0
+            for op in onnx_model.opset_import
+        )
+        if not has_default_opset:
+            del onnx_model.opset_import[:]
+            opset = onnx_model.opset_import.add()
+            opset.domain = ""
+            opset.version = 18
+        if onnx_model.ir_version == 0:
+            onnx_model.ir_version = 9
 
         quant_sim = QuantizationSimModel(
             model=onnx_model,
@@ -2232,17 +2292,6 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
         )
         dataloader = DataLoader(dataset, batch_size=1, collate_fn=dataset.collate_fn)
 
-        input_spec = self.get_input_spec(
-            llm_config=self.llm_config.to_dict(),
-            sequence_length=self.sequence_length,
-            context_length=self.context_length,
-            llm_io_type=self.llm_io_type,
-        )
-        assert input_spec is not None
-        inputs: list[list[torch.Tensor | np.ndarray]] = [
-            [] for _ in range(len(input_spec))
-        ]
-
         assert self.EmbeddingClass is not None
         rope_embeddings = self.EmbeddingClass(
             max_length=self.context_length, config=self.llm_config
@@ -2253,6 +2302,10 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
             rope_embeddings,
         )
 
+        # Dynamically allocate input slots based on what prefill actually
+        # produces, which matches the ONNX session's input count.
+        inputs: list[list[torch.Tensor | np.ndarray]] | None = None
+
         # Only bother removing quantization if we don't have a floating point model provided
         with self.remove_quantization():
             # for data in dataloader
@@ -2261,10 +2314,16 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
             ):
                 input_ids, attention_mask, _ = sample
                 for prefilled_inputs in generator.prefill(input_ids, attention_mask):
+                    if inputs is None:
+                        inputs = [[] for _ in range(len(prefilled_inputs))]
                     for i, tensor in enumerate(prefilled_inputs):
                         inputs[i].append(tensor)
 
-        return make_hub_dataset_entries(tuple(inputs), list(input_spec.keys()))
+        assert inputs is not None
+        # Use the ONNX session's input names which match positional order
+        assert self.quant_sim is not None
+        input_names = [inp.name for inp in self.quant_sim.session.get_inputs()]
+        return make_hub_dataset_entries(tuple(inputs), input_names)
 
     def get_evaluator(
         self, task: str = "wikitext", device: torch.device = torch.device("cpu")
