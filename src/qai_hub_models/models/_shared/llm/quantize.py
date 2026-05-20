@@ -35,10 +35,13 @@ def quantize(
     checkpoint: str | None = None,
     use_seq_mse: bool = False,
     use_ada_scale: bool = False,
+    use_spin_quant: bool = False,
     allow_cpu_to_quantize: bool = False,
     seq_mse_num_samples: int | None = None,
     ada_scale_num_samples: int | None = None,
     ada_scale_num_iterations: int | None = None,
+    spin_quant_num_samples: int | None = None,
+    spin_quant_num_iterations: int | None = None,
     use_dynamic_shapes: bool = False,
 ) -> None:
     if use_dynamic_shapes:
@@ -50,7 +53,7 @@ def quantize(
             raise ValueError(
                 "This model requires a CUDA GPU (V100/A100) on it to do quantization. Please re-try with GPU machine."
             )
-        if use_seq_mse or use_ada_scale:
+        if use_seq_mse or use_ada_scale or use_spin_quant:
             raise ValueError(
                 "This quantization technique requires a CUDA GPU (V100/A100). Please re-try with GPU machine."
             )
@@ -89,6 +92,8 @@ def quantize(
         num_max_samples = max(num_max_samples, seq_mse_num_samples)
     if use_ada_scale and ada_scale_num_samples is not None:
         num_max_samples = max(num_max_samples, ada_scale_num_samples)
+    if use_spin_quant and spin_quant_num_samples is not None:
+        num_max_samples = max(num_max_samples, spin_quant_num_samples)
 
     calib_data = model_quant.get_calibration_data(num_samples=num_max_samples)
     assert calib_data is not None
@@ -97,7 +102,7 @@ def quantize(
     gc.collect()
     torch.cuda.empty_cache()
 
-    if use_seq_mse or use_ada_scale:
+    if use_seq_mse or use_ada_scale or use_spin_quant:
         print()
         print("NOTE: This quantization technique can take hours to complete.")
 
@@ -107,9 +112,12 @@ def quantize(
         num_samples=num_samples,
         use_seq_mse=use_seq_mse,
         use_ada_scale=use_ada_scale,
+        use_spin_quant=use_spin_quant,
         seq_mse_num_samples=seq_mse_num_samples,
         ada_scale_num_samples=ada_scale_num_samples,
         ada_scale_num_iterations=ada_scale_num_iterations,
+        spin_quant_num_samples=spin_quant_num_samples,
+        spin_quant_num_iterations=spin_quant_num_iterations,
     )
 
     save_kwargs: dict[str, Any] = dict(fp_model=fp_model)
@@ -168,6 +176,12 @@ def llm_quantize(
         help="Add to apply AdaScale.",
     )
     parser.add_argument(
+        "--use-spin-quant",
+        action="store_true",
+        default=False,
+        help="Add to apply SpinQuant (learned rotation matrices).",
+    )
+    parser.add_argument(
         "--num-samples",
         type=int,
         default=20,
@@ -190,6 +204,18 @@ def llm_quantize(
         type=int,
         default=None,
         help="Number of iterations for AdaScale.",
+    )
+    parser.add_argument(
+        "--spin-quant-num-samples",
+        type=int,
+        default=None,
+        help="Number of samples for SpinQuant.",
+    )
+    parser.add_argument(
+        "--spin-quant-num-iterations",
+        type=int,
+        default=None,
+        help="Number of iterations for SpinQuant.",
     )
     parser.add_argument(
         "--precision",
@@ -217,10 +243,13 @@ def llm_quantize(
         checkpoint=args.checkpoint,
         use_seq_mse=args.use_seq_mse,
         use_ada_scale=args.use_ada_scale,
+        use_spin_quant=args.use_spin_quant,
         allow_cpu_to_quantize=allow_cpu_to_quantize,
         seq_mse_num_samples=args.seq_mse_num_samples,
         ada_scale_num_samples=args.ada_scale_num_samples,
         ada_scale_num_iterations=args.ada_scale_num_iterations,
+        spin_quant_num_samples=args.spin_quant_num_samples,
+        spin_quant_num_iterations=args.spin_quant_num_iterations,
         use_dynamic_shapes=args.use_dynamic_shapes,
     )
     print("Quantization completed successfully.")

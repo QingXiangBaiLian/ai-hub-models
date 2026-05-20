@@ -120,6 +120,7 @@ try:
     )
     from qai_hub_models.utils.quantization_aimet_onnx import (
         ensure_min_aimet_onnx_version,
+        _fix_unsupported_channel_axis,
     )
 
     AIMET_ONNX_INSTALLED = True
@@ -314,6 +315,8 @@ def get_onnx_model(
                 f"Exporting ONNX model with sequence length {sequence_length} and context length {context_length}. This could take around 10 minutes."
             )
 
+    what = [input_specs[name][0] for name in input_specs]
+    print("=====", what)
     example_input = [
         torch.zeros(
             input_specs[name][0], dtype=getattr(torch, input_specs[name][1])
@@ -400,9 +403,7 @@ def get_onnx_model(
                 tuple(example_input),
                 path,
                 input_names=list(input_specs.keys()),
-                output_names=fp_model._get_output_names(
-                    fp_model.llm_config.num_hidden_layers
-                ),
+                output_names=fp_model.get_output_names(),
                 **extra,
             )
 
@@ -1335,6 +1336,12 @@ class LLMBase(BaseModel, LLMConfigEditor, ABC):
             output_names.append(f"past_value_{layer}_out")
         return output_names
 
+    @staticmethod
+    def get_output_names() -> list[str]:
+        raise NotImplementedError(
+            "Subclasses must implement get_output_names()"
+        )
+
     # Must be defined by transformers generator class
     @property
     def main_input_name(self) -> str:
@@ -1842,6 +1849,7 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
                     print(
                         f"Loading the encodings from path {checkpoint} to load the QuantSim model."
                     )
+                    _fix_unsupported_channel_axis(quant_sim)
                     load_encodings_to_sim(quant_sim, aimet_encodings, strict=False)
         else:
             quant_sim = None
@@ -2239,9 +2247,6 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
             llm_io_type=self.llm_io_type,
         )
         assert input_spec is not None
-        inputs: list[list[torch.Tensor | np.ndarray]] = [
-            [] for _ in range(len(input_spec))
-        ]
 
         assert self.EmbeddingClass is not None
         rope_embeddings = self.EmbeddingClass(
@@ -2253,18 +2258,26 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
             rope_embeddings,
         )
 
-        # Only bother removing quantization if we don't have a floating point model provided
         with self.remove_quantization():
-            # for data in dataloader
+            first_sample = True
             for sample in tqdm(
                 dataloader, total=len(dataloader), desc="Pre-filling calibration data"
             ):
                 input_ids, attention_mask, _ = sample
                 for prefilled_inputs in generator.prefill(input_ids, attention_mask):
+                    if first_sample:
+                        inputs: list[list[torch.Tensor | np.ndarray]] = [
+                            [] for _ in range(len(prefilled_inputs))
+                        ]
+                        input_names = [
+                            k for k in input_spec
+                            if not k.startswith("conv_state_") and not k.startswith("recurrent_state_")
+                        ]
+                        first_sample = False
                     for i, tensor in enumerate(prefilled_inputs):
                         inputs[i].append(tensor)
 
-        return make_hub_dataset_entries(tuple(inputs), list(input_spec.keys()))
+        return make_hub_dataset_entries(tuple(inputs), input_names)
 
     def get_evaluator(
         self, task: str = "wikitext", device: torch.device = torch.device("cpu")

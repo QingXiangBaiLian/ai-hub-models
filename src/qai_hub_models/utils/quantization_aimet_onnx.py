@@ -49,6 +49,7 @@ from qai_hub_models.utils.runtime_torch_wrapper import kwargs_to_dict
 DEFAULT_SEQ_MSE_NUM_SAMPLES = 20
 DEFAULT_ADA_SCALE_NUM_SAMPLES = 128
 DEFAULT_ADA_SCALE_NUM_ITERATIONS = 512
+DEFAULT_SPIN_QUANT_NUM_ITERATIONS = 200
 
 
 def ensure_aimet_onnx_installed(
@@ -101,6 +102,466 @@ def ensure_max_aimet_onnx_version(
             f"Installed AIMET-ONNX version not supported. Expected=<{expected_version}, got {aimet_onnx.__version__!s}\n"
             f"Please run `pip install transformers=={expected_version}`"
         )
+
+
+def _fix_unsupported_channel_axis(quant_sim: QuantSimOnnx) -> None:
+    for name, quantizer in quant_sim.qc_quantize_op_dict.items():
+        if not quantizer.enabled:
+            continue
+        if not quantizer.quant_info.usePerChannelMode:
+            continue
+        channel_axis = quantizer.quant_info.channelAxis
+        if channel_axis not in (0, 1):
+            if (
+                quantizer.tensor_quantizer_params is not None
+                and quantizer.tensor_quantizer_params.tensor_shape is not None
+            ):
+                tensor_shape = quantizer.tensor_quantizer_params.tensor_shape
+                ndim = len(tensor_shape)
+                print(
+                    f"[SeqMSE Fix] Quantizer '{name}' has unsupported channel_axis={channel_axis}, "
+                    f"tensor_shape={tensor_shape}, blockSize={quantizer.quant_info.blockSize}, "
+                    f"blockAxis={quantizer.quant_info.blockAxis}"
+                )
+                if ndim == 4 and channel_axis == ndim - 1:
+                    quantizer.quant_info.channelAxis = 0
+                    quantizer.quant_info.blockAxis = 1
+                    quantizer._tensor_quantizer = quantizer._build_tensor_quantizer()
+                    print(
+                        f"[SeqMSE Fix] Fixed quantizer '{name}': channelAxis=0, blockAxis=1"
+                    )
+                elif ndim == 4 and channel_axis == ndim - 2:
+                    quantizer.quant_info.channelAxis = 1
+                    quantizer.quant_info.blockAxis = 0
+                    quantizer._tensor_quantizer = quantizer._build_tensor_quantizer()
+                    print(
+                        f"[SeqMSE Fix] Fixed quantizer '{name}': channelAxis=1, blockAxis=0"
+                    )
+                else:
+                    print(
+                        f"[SeqMSE Fix] WARNING: Cannot auto-fix quantizer '{name}' with "
+                        f"channel_axis={channel_axis}, ndim={ndim}. "
+                        f"Disabling per-channel mode for this quantizer."
+                    )
+                    quantizer.quant_info.usePerChannelMode = False
+                    quantizer.quant_info.channelAxis = 0
+                    quantizer.quant_info.blockSize = 0
+                    quantizer._tensor_quantizer = quantizer._build_tensor_quantizer()
+
+
+_trilu_converter_registered = False
+
+
+def _register_trilu_converter() -> None:
+    global _trilu_converter_registered
+    if _trilu_converter_registered:
+        return
+    try:
+        from onnx2torch.node_converters.registry import (
+            OperationDescription,
+            _CONVERTER_REGISTRY,
+            add_converter,
+        )
+        from onnx2torch.onnx_graph import OnnxGraph
+        from onnx2torch.onnx_node import OnnxNode
+        from onnx2torch.utils.common import (
+            OnnxToTorchModule,
+            OperationConverterResult,
+            onnx_mapping_from_node,
+        )
+    except ImportError:
+        return
+
+    trilu_desc = OperationDescription(
+        domain="",
+        operation_type="Trilu",
+        version=14,
+    )
+    if trilu_desc in _CONVERTER_REGISTRY:
+        _trilu_converter_registered = True
+        return
+
+    import torch
+    from torch import nn
+
+    class OnnxTrilu(nn.Module, OnnxToTorchModule):
+        def __init__(self, upper: bool = True):
+            super().__init__()
+            self.upper = upper
+
+        def forward(
+            self, input_tensor: torch.Tensor, diagonal: torch.Tensor | None = None
+        ) -> torch.Tensor:
+            diag_val = 0
+            if diagonal is not None:
+                diag_val = int(diagonal.item())
+            if self.upper:
+                return torch.triu(input_tensor, diagonal=diag_val)
+            return torch.tril(input_tensor, diagonal=diag_val)
+
+    @add_converter(operation_type="Trilu", version=14)
+    def _(
+        node: OnnxNode, graph: OnnxGraph
+    ) -> OperationConverterResult:
+        upper = node.attributes.get("upper", 1) != 0
+        return OperationConverterResult(
+            torch_module=OnnxTrilu(upper=upper),
+            onnx_mapping=onnx_mapping_from_node(node=node),
+        )
+
+    _trilu_converter_registered = True
+
+
+def _find_block_state_inputs(sim_model, block_input_name, block_output_name, all_state_names, common_input_names=None):
+    import onnx_ir
+
+    graph = sim_model.graph
+    values = onnx_ir.convenience.create_value_mapping(graph, include_subgraphs=False)
+
+    output_val = values[block_output_name]
+    input_frontier = set()
+    visited_nodes = set()
+    visited_values = set()
+    value_stack = [output_val]
+
+    boundary_names = {block_input_name}
+    if common_input_names:
+        boundary_names.update(common_input_names)
+
+    while value_stack:
+        value = value_stack.pop()
+        if value in visited_values:
+            continue
+        visited_values.add(value)
+        if value.is_initializer():
+            continue
+        if value.name in boundary_names:
+            continue
+        producer = value.producer()
+        if producer is not None and producer not in visited_nodes:
+            visited_nodes.add(producer)
+            for inp in producer.inputs:
+                if inp is not None and inp not in visited_values:
+                    value_stack.append(inp)
+
+    for node in visited_nodes:
+        for inp in node.inputs:
+            if inp is None:
+                continue
+            producer = inp.producer()
+            if producer is None or producer not in visited_nodes:
+                input_frontier.add(inp)
+
+    state_name_set = set(all_state_names)
+    block_state_names = []
+    for val in sorted(input_frontier, key=lambda v: v.name or ""):
+        if val.name in state_name_set:
+            block_state_names.append(val.name)
+
+    return block_state_names
+
+
+def _qwen3_5_apply_adascale(cls, sim, inputs, adascale_model_config, num_iterations):
+    import gc
+    import tempfile
+
+    import onnx_ir
+    import torch
+
+    from aimet_onnx.experimental.adascale.adascale_optimizer import (
+        _DEBUG_NUM_PARTIAL_ITERATIONS,
+        _DEBUG_NUM_PARTIAL_ITERATIONS_END,
+        _DEBUG_NUM_PARTIAL_ITERATIONS_START,
+        AdaScale,
+        get_decoder_blocks_end_points,
+    )
+    from aimet_onnx.experimental.adascale.activation_sampler import ActivationSampler
+    from aimet_onnx.utils import get_torch_device
+    from aimet_onnx import ir_utils
+
+    _orig_optimize_adascale_block = AdaScale.optimize_adascale_block
+
+    @staticmethod
+    def _patched_optimize_adascale_block(
+        sim_model,
+        quantizer_dict,
+        fp_inputs,
+        quantized_inputs,
+        block_input_output_names,
+        beta_gamma_lr=1e-3,
+        scales_lr=5e-4,
+        num_iterations=1500,
+        device=torch.device("cpu"),
+    ):
+        from aimet_onnx.experimental.adascale.model_converter import (
+            copy_pt_encodings_to_sim,
+            copy_pt_weights_to_onnx,
+            get_pt_block,
+        )
+        from aimet_onnx.experimental.adascale.utils import (
+            change_tensor_device_placement,
+            convert_to_torch,
+        )
+        from aimet_onnx.experimental.adascale.quantizer import (
+            add_qlinear_layers,
+            get_adascale_trainable_params,
+            replace_with_adascale_quantizers,
+        )
+
+        pytorch_block, pt_weights_to_onnx_initializers = get_pt_block(
+            sim_model, block_input_output_names
+        )
+        pytorch_block.requires_grad_(False)
+
+        torch_fp_input = convert_to_torch(fp_inputs)
+        torch_quant_input = convert_to_torch(quantized_inputs)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        pytorch_block.to(device)
+        fp_out = []
+        with torch.no_grad():
+            for input_tensor in torch_fp_input:
+                if isinstance(input_tensor, torch.Tensor):
+                    input_tensor = [input_tensor]
+
+                input_tensor = [
+                    inp_t.to(device=device) for inp_t in input_tensor
+                ]
+                out = pytorch_block(*input_tensor).detach()
+
+                out.requires_grad_(False)
+                fp_out.append(change_tensor_device_placement(out, torch.device("cpu")))
+                del out, input_tensor
+                torch.cuda.empty_cache()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        pytorch_block = add_qlinear_layers(
+            pytorch_block, bitwidth=AdaScale.ADASCALE_PARAM_BW
+        )
+        replace_with_adascale_quantizers(pytorch_block)
+
+        all_beta_gamma_parameters, all_scale_parameters = get_adascale_trainable_params(
+            pytorch_block
+        )
+        adascale_params = all_beta_gamma_parameters + all_scale_parameters
+        for p in adascale_params:
+            p.requires_grad = True
+
+        trainable_params = [
+            {
+                "params": all_beta_gamma_parameters,
+                "lr": beta_gamma_lr,
+            },
+            {
+                "params": all_scale_parameters,
+                "lr": scales_lr,
+            },
+        ]
+
+        optimizer = torch.optim.Adam(trainable_params)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=num_iterations, eta_min=0.0
+        )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        pytorch_block.to(device)
+        with torch.set_grad_enabled(True):
+            for iteration in tqdm(range(num_iterations)):
+                fp_input = torch_fp_input[iteration % len(torch_fp_input)]
+                quant_input = torch_quant_input[iteration % len(torch_quant_input)]
+                input_tensor = quant_input
+                if isinstance(input_tensor, torch.Tensor):
+                    input_tensor = [input_tensor]
+                input_tensor = [
+                    inp_t.to(device=device) for inp_t in input_tensor
+                ]
+                quant_out = pytorch_block(*input_tensor)
+                batch_fp_out = fp_out[iteration % len(torch_fp_input)].to(device)
+                loss = torch.nn.functional.mse_loss(quant_out, batch_fp_out)
+
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                del quant_out, batch_fp_out, loss, input_tensor, fp_input, quant_input
+
+                if iteration % 10 == 0:
+                    torch.cuda.empty_cache()
+
+        copy_pt_weights_to_onnx(
+            pytorch_block, sim_model, pt_weights_to_onnx_initializers
+        )
+        copy_pt_encodings_to_sim(
+            pytorch_block, quantizer_dict, pt_weights_to_onnx_initializers
+        )
+
+        del (
+            pytorch_block,
+            torch_quant_input,
+            torch_fp_input,
+            optimizer,
+            pt_weights_to_onnx_initializers,
+            fp_out,
+            fp_inputs,
+            quantized_inputs,
+        )
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    AdaScale.optimize_adascale_block = _patched_optimize_adascale_block
+
+    try:
+        with cls._disable_activation_quantizers(sim):
+            sim._compute_param_encodings(overwrite=False)
+
+            blocks_end_points = get_decoder_blocks_end_points(
+                sim, adascale_model_config.model_type
+            )
+
+            device = get_torch_device(sim.session)
+            graph_input_names = [inp.name for inp in sim.session.get_inputs()]
+            if graph_input_names != list(inputs[0].keys()):
+                raise ValueError(
+                    "Graph input names do not match the keys in the provided inputs."
+                )
+
+            print("graph_input_names: ", graph_input_names)
+            common_input_names = []
+            for name in graph_input_names:
+                if "attention" in name:
+                    common_input_names.append(name)
+                if "position" in name:
+                    common_input_names.append(name)
+                if "input_ids" in name or "input_embeds" in name:
+                    common_input_names.append(name)
+
+            all_state_names = [
+                name
+                for name in graph_input_names
+                if name.startswith("past_key_")
+                or name.startswith("past_value_")
+                or name.startswith("conv_state_")
+                or name.startswith("recurrent_state_")
+            ]
+
+            del sim.session
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            with tempfile.TemporaryDirectory() as tempdir:
+                fp32_path = f"{tempdir}/fp32_model.onnx"
+                sim_path = f"{tempdir}/sim_model.onnx"
+                sim_model = onnx_ir.from_proto(sim.model.model)
+                onnx_ir.passes.common.TopologicalSortPass().call(sim_model)
+                fp32_model = sim_model.clone()
+                ir_utils.remove_aimet_quantizers(fp32_model)
+                onnx_ir.save(fp32_model, fp32_path, external_data="fp32_model.data")
+
+                del fp32_model
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                for idx in range(len(blocks_end_points)):
+                    if (
+                        _DEBUG_NUM_PARTIAL_ITERATIONS is not None
+                        and idx >= _DEBUG_NUM_PARTIAL_ITERATIONS
+                    ):
+                        break
+                    if (
+                        _DEBUG_NUM_PARTIAL_ITERATIONS_START is not None
+                        and _DEBUG_NUM_PARTIAL_ITERATIONS_END is not None
+                        and (
+                            idx < _DEBUG_NUM_PARTIAL_ITERATIONS_START
+                            or idx >= _DEBUG_NUM_PARTIAL_ITERATIONS_END
+                        )
+                    ):
+                        continue
+
+                    block_input_name = blocks_end_points[idx][0].inputs[0].name
+                    block_output_name = blocks_end_points[idx][1].inputs[0].name
+
+                    block_state_tensor_names = _find_block_state_inputs(
+                        sim_model, block_input_name, block_output_name, all_state_names, common_input_names
+                    )
+                    print(f"idx: {idx}, block_state_tensor_names: {block_state_tensor_names}")
+
+                    block_input_names = list(common_input_names)
+                    if len(block_state_tensor_names) > 0:
+                        block_input_names.extend(block_state_tensor_names)
+
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                    onnx_ir.save(sim_model, path=sim_path, external_data="sim_model.data")
+                    qsim_sess = ActivationSampler(
+                        blocks_end_points[idx][0].inputs[0].name,
+                        sim_path,
+                        sim.providers,
+                    )
+
+                    fp_inputs, qsim_inputs = [], []
+                    for input_data in inputs:
+                        qsim_inputs.append(qsim_sess.sample_acts(input_data))
+                    del qsim_sess
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                    fp32_sampler = ActivationSampler(
+                        blocks_end_points[idx][0].inputs[0].name,
+                        fp32_path,
+                        sim.providers,
+                    )
+                    for input_data in inputs:
+                        fp_inputs.append(fp32_sampler.sample_acts(input_data))
+                    del fp32_sampler
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                    fp_input_list = []
+                    qsim_input_list = []
+                    for i in range(len(fp_inputs)):
+                        fp_list, qsim_list = [], []
+                        fp_list.append(fp_inputs[i])
+                        qsim_list.append(qsim_inputs[i])
+                        for name in block_input_names:
+                            fp_list.append(inputs[i][name])
+                            qsim_list.append(inputs[i][name])
+                        fp_input_list.append(fp_list)
+                        qsim_input_list.append(qsim_list)
+
+                    block_input_output_names = AdaScale.get_block_start_end_name(
+                        blocks_end_points, idx, block_input_names
+                    )
+                    print("idx: ", idx, "block_input_output_names: ", block_input_output_names)
+
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                    AdaScale.optimize_adascale_block(
+                        sim_model,
+                        sim.qc_quantize_op_dict,
+                        fp_input_list,
+                        qsim_input_list,
+                        block_input_output_names,
+                        adascale_model_config.beta_gamma_lr,
+                        adascale_model_config.scales_lr,
+                        num_iterations,
+                        device,
+                    )
+                    del fp_input_list, qsim_input_list, fp_inputs, qsim_inputs
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                sim.model.model.CopyFrom(onnx_ir.to_proto(sim_model))
+                sim._rebuild_session()
+    finally:
+        AdaScale.optimize_adascale_block = _orig_optimize_adascale_block
 
 
 @contextmanager
@@ -232,6 +693,7 @@ class AIMETOnnxQuantizableMixin(PretrainedHubModelProtocol):
     def _apply_seq_mse(self, data: _DataLoader, num_batches: int) -> None:
         assert self.quant_sim is not None
         ensure_min_aimet_onnx_version("2.8.0")
+        _fix_unsupported_channel_axis(self.quant_sim)
         aimet_onnx.apply_seq_mse(
             self.quant_sim, self._dataloader_to_numpy(data, num_batches)
         )
@@ -248,11 +710,43 @@ class AIMETOnnxQuantizableMixin(PretrainedHubModelProtocol):
         ensure_min_aimet_onnx_version("2.26.0")
         from aimet_onnx.experimental.adascale.adascale_optimizer import (
             AdaScale,
+            AdaScaleModelConfig,
             adascale_model_config_dict,
         )
 
+        _register_trilu_converter()
+
+        if model_type == "qwen3_5":
+            if "qwen3_5" not in adascale_model_config_dict:
+                adascale_model_config_dict["qwen3_5"] = AdaScaleModelConfig(
+                    model_type="qwen3_5",
+                    beta_gamma_lr=1e-3,
+                    scales_lr=5e-4,
+                )
+            import aimet_onnx.experimental.adascale.find_blocks as find_blocks_mod
+            import aimet_onnx.experimental.adascale.adascale_optimizer as adascale_mod
+            _orig_get_decoder_blocks = find_blocks_mod.get_decoder_blocks_end_points
+
+            def _patched_get_decoder_blocks(quantsim, mt):
+                if mt == "qwen3_5":
+                    mt = "qwen3"
+                return _orig_get_decoder_blocks(quantsim, mt)
+
+            find_blocks_mod.get_decoder_blocks_end_points = _patched_get_decoder_blocks
+            adascale_mod.get_decoder_blocks_end_points = _patched_get_decoder_blocks
+
+            _orig_apply_adascale = AdaScale.apply_adascale
+
+            @classmethod
+            def _patched_apply_adascale(cls, sim, inputs, adascale_model_config, num_iterations=1500):
+                return _qwen3_5_apply_adascale(
+                    cls, sim, inputs, adascale_model_config, num_iterations
+                )
+
+            AdaScale.apply_adascale = _patched_apply_adascale
+
         restore_value: int | None = None
-        if model_type == "qwen3" and num_rmsnorm_per_blk is not None:
+        if model_type in ("qwen3", "qwen3_5") and num_rmsnorm_per_blk is not None:
             from aimet_onnx.graph_passes.passes.decoder_block import DecoderBlockQwen3
 
             restore_value = DecoderBlockQwen3.NUM_RMSNORM_PER_BLK
@@ -265,8 +759,107 @@ class AIMETOnnxQuantizableMixin(PretrainedHubModelProtocol):
             num_iterations=num_iterations,
         )
 
+        if model_type == "qwen3_5":
+            AdaScale.apply_adascale = _orig_apply_adascale
+
         if restore_value is not None:
             DecoderBlockQwen3.NUM_RMSNORM_PER_BLK = restore_value
+
+    def _apply_spin_quant(
+        self,
+        data: _DataLoader,
+        num_batches: int,
+        num_iterations: int = 200,
+    ) -> None:
+        assert self.quant_sim is not None
+        import numpy as np
+        from onnx import numpy_helper
+
+        print(f"SpinQuant: Learning rotation matrices ({num_iterations} iterations)")
+
+        model = self.quant_sim.model.model
+
+        initializers = {init.name: init for init in model.graph.initializer}
+
+        weight_entries = []
+        for node in model.graph.node:
+            if node.op_type == "MatMul" and len(node.input) >= 2:
+                weight_name = node.input[1]
+                if weight_name in initializers:
+                    weight = numpy_helper.to_array(initializers[weight_name])
+                    if weight.ndim == 2 and weight.shape[0] >= 16 and weight.shape[1] >= 16:
+                        weight_entries.append((weight_name, weight, "matmul"))
+            elif node.op_type == "Conv" and len(node.input) >= 2:
+                weight_name = node.input[1]
+                if weight_name in initializers:
+                    weight = numpy_helper.to_array(initializers[weight_name])
+                    if weight.ndim == 4 and weight.shape[2:] == (1, 1) and weight.shape[0] >= 16 and weight.shape[1] >= 16:
+                        weight_2d = weight.reshape(weight.shape[0], -1)
+                        weight_entries.append((weight_name, weight_2d, "conv"))
+
+        if not weight_entries:
+            print("SpinQuant: No eligible weights found, skipping")
+            return
+
+        print(f"SpinQuant: Found {len(weight_entries)} eligible weight matrices")
+
+        rotation_matrices = {}
+        for weight_name, weight, _ in weight_entries:
+            out_dim = weight.shape[0]
+            rng = np.random.RandomState(42)
+            Q = np.linalg.qr(rng.randn(out_dim, out_dim).astype(np.float32))[0]
+            rotation_matrices[weight_name] = Q.astype(np.float32)
+
+        best_loss = float("inf")
+        best_rotations = {k: v.copy() for k, v in rotation_matrices.items()}
+
+        for iteration in range(num_iterations):
+            total_loss = 0.0
+            for weight_name, weight, _ in weight_entries:
+                Q = rotation_matrices[weight_name]
+                rotated_weight = Q @ weight
+
+                channel_max = np.max(np.abs(rotated_weight), axis=1, keepdims=True)
+                channel_max = np.clip(channel_max, 1e-8, None)
+                scale = channel_max / 127.0
+                quantized = np.round(rotated_weight / scale) * scale
+                residual = rotated_weight - quantized
+                loss = np.mean(residual ** 2)
+                total_loss += loss
+
+                grad_rot = 2.0 * residual @ weight.T / (weight.shape[0] * weight.shape[1])
+                step_size = 0.01 / (1.0 + iteration * 0.005)
+                Q_new = Q - step_size * grad_rot
+                U, _, Vt = np.linalg.svd(Q_new, full_matrices=False)
+                rotation_matrices[weight_name] = (U @ Vt).astype(np.float32)
+
+            if total_loss < best_loss:
+                best_loss = total_loss
+                best_rotations = {k: v.copy() for k, v in rotation_matrices.items()}
+
+            if iteration % 50 == 0 or iteration == num_iterations - 1:
+                print(f"  Iteration {iteration}/{num_iterations}, loss={total_loss:.6f}")
+
+        print(f"SpinQuant: Best loss={best_loss:.6f}, applying rotations to weights")
+
+        for weight_name, weight, entry_type in weight_entries:
+            Q = best_rotations[weight_name]
+            rotated_weight = Q @ weight
+
+            if entry_type == "conv":
+                original_shape = numpy_helper.to_array(initializers[weight_name]).shape
+                rotated_weight = rotated_weight.reshape(original_shape)
+
+            rotated_tensor = numpy_helper.from_array(
+                rotated_weight.astype(np.float32), name=weight_name
+            )
+            for i, init in enumerate(model.graph.initializer):
+                if init.name == weight_name:
+                    model.graph.initializer[i].CopyFrom(rotated_tensor)
+                    break
+
+        self.quant_sim._rebuild_session()
+        print("SpinQuant: Rotation matrices applied successfully")
 
     def _apply_calibration(self, data: DataLoader, num_batches: int) -> None:
         assert self.quant_sim is not None
@@ -279,9 +872,12 @@ class AIMETOnnxQuantizableMixin(PretrainedHubModelProtocol):
         num_samples: int | None = None,
         use_seq_mse: bool = False,
         use_ada_scale: bool = False,
+        use_spin_quant: bool = False,
         seq_mse_num_samples: int | None = None,
         ada_scale_num_samples: int | None = None,
         ada_scale_num_iterations: int | None = None,
+        spin_quant_num_samples: int | None = None,
+        spin_quant_num_iterations: int | None = None,
     ) -> None:
         """
         Quantize the model using calibration data.
@@ -298,12 +894,18 @@ class AIMETOnnxQuantizableMixin(PretrainedHubModelProtocol):
             Whether to apply sequential MSE optimization during quantization.
         use_ada_scale
             Whether to apply AdaScale optimization during quantization.
+        use_spin_quant
+            Whether to apply SpinQuant (learned rotation) optimization during quantization.
         seq_mse_num_samples
             Number of samples for sequential MSE. Defaults to num_samples.
         ada_scale_num_samples
             Number of samples for AdaScale.
         ada_scale_num_iterations
             Number of iterations for AdaScale.
+        spin_quant_num_samples
+            Number of samples for SpinQuant.
+        spin_quant_num_iterations
+            Number of iterations for SpinQuant.
 
         Returns
         -------
@@ -340,6 +942,26 @@ class AIMETOnnxQuantizableMixin(PretrainedHubModelProtocol):
             )
             print()
             self._apply_seq_mse(data=data, num_batches=seq_mse_num_batches)
+
+        if use_spin_quant:
+            spin_quant_num_samples_val = min(
+                len(data) // batches_per_sample,
+                spin_quant_num_samples or num_samples or DEFAULT_SEQ_MSE_NUM_SAMPLES,
+            )
+            spin_quant_num_batches = spin_quant_num_samples_val * batches_per_sample
+            spin_quant_num_iters = (
+                spin_quant_num_iterations or DEFAULT_SPIN_QUANT_NUM_ITERATIONS
+            )
+            print()
+            print(
+                f"Apply SpinQuant ({spin_quant_num_samples_val} samples / {spin_quant_num_batches} batches, {spin_quant_num_iters} iterations)"
+            )
+            print()
+            self._apply_spin_quant(
+                data=data,
+                num_batches=spin_quant_num_batches,
+                num_iterations=spin_quant_num_iters,
+            )
 
         if use_ada_scale:
             assert self.ada_scale_model_type is not None

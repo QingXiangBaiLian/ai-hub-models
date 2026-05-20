@@ -32,14 +32,16 @@ if TYPE_CHECKING:
     from PIL import Image
 
 
-def _dynamic_cache_to_legacy_list(cache: DynamicCache) -> list[torch.Tensor]:
+def _dynamic_cache_to_flat_list(cache: DynamicCache) -> list[torch.Tensor]:
+    """Convert a DynamicCache to a flat list of [key, value, key, value, ...]."""
     if hasattr(cache, "to_legacy_cache"):
         return list(itertools.chain.from_iterable(cache.to_legacy_cache()))
-    return list(
-        itertools.chain.from_iterable(
-            (layer.keys, layer.values) for layer in cache.layers
-        )
-    )
+    # transformers 5.x: layers API
+    result: list[torch.Tensor] = []
+    for layer in cache.layers:
+        result.append(layer.keys)  # type: ignore[attr-defined, unused-ignore]
+        result.append(layer.values)  # type: ignore[attr-defined, unused-ignore]
+    return result
 
 
 def get_past_keyval_with_shift(
@@ -430,12 +432,19 @@ class LLM_Generator(GenerationMixin, torch.nn.Module):
                 0
                 if len(past_key_values.value_cache) == 0
                 or past_key_values.value_cache[0] == []
-                else past_key_values.value_cache[0][0].shape[-1]
+                else past_key_values.value_cache[0].shape[-2]
             )
         elif hasattr(past_key_values, "layers"):
-            num_processed_tokens = past_key_values.get_seq_length()
+            if past_key_values.layers and hasattr(past_key_values.layers[0], "values"):  # type: ignore[attr-defined, unused-ignore]
+                num_processed_tokens = (
+                    0
+                    if past_key_values.layers[0].values is None  # type: ignore[attr-defined, unused-ignore]
+                    else past_key_values.layers[0].values.shape[-2]  # type: ignore[attr-defined, unused-ignore]
+                )
+            else:
+                num_processed_tokens = 0
         else:
-            raise ValueError(f"Unsupported KV cache type: {type(past_key_values)}")
+            raise ValueError("Unsupported KV cache type")
 
         inputs: dict[str, torch.Tensor | DynamicCache | None] = {}
         if inputs_embeds is not None and num_processed_tokens < inputs_embeds.shape[1]:
@@ -474,6 +483,11 @@ class LLM_Generator(GenerationMixin, torch.nn.Module):
         print(
             f"Switching from sequence_length={self.selected_model.sequence_length} to sequence_length={new_selected_model.sequence_length}"
         )
+
+        # Transfer persistent state (e.g. linear attention cache) before release
+        old_model = self.selected_model
+        _linear_attn_cache = getattr(old_model, "_linear_attn_cache", None)
+
         # release the model to preserve memory
         if isinstance(self.selected_model, (LLM_Loader, LLM_AIMETOnnx, LLM_QNN)):
             self.selected_model.release()
@@ -483,6 +497,11 @@ class LLM_Generator(GenerationMixin, torch.nn.Module):
             if isinstance(new_selected_model, LLM_Loader)
             else new_selected_model
         )
+
+        # Restore persistent state on the new model
+        if _linear_attn_cache is not None:
+            self.selected_model._linear_attn_cache = _linear_attn_cache
+
         return self.selected_model
 
     @staticmethod
@@ -618,20 +637,21 @@ class LLM_Generator(GenerationMixin, torch.nn.Module):
             cm_attention_mask = cm_attention_mask.clip(min=attention_mask_min_clip)
 
         if self.llm_io_type == LLMIOType.huggingface_input_ids:
-            return (
+            base_inputs = [
                 padded_input_tokens,
                 cm_attention_mask,
                 position_ids,
-                *padded_past_key_values,
-            )
-        position_ids_cos, position_ids_sin = self.embedding.get_embedding(position_ids)
-        return (
-            padded_input_tokens,
-            cm_attention_mask,
-            position_ids_cos,
-            position_ids_sin,
-            *padded_past_key_values,
-        )
+            ]
+        else:
+            position_ids_cos, position_ids_sin = self.embedding.get_embedding(position_ids)
+            base_inputs = [
+                padded_input_tokens,
+                cm_attention_mask,
+                position_ids_cos,
+                position_ids_sin,
+            ]
+
+        return tuple(base_inputs + padded_past_key_values)
 
     def combine_local_and_global_outputs(
         self,
@@ -662,9 +682,15 @@ class LLM_Generator(GenerationMixin, torch.nn.Module):
             global_outputs["logits"] = local_logits
 
         # strip KV cache corresponding to padding tokens
+        # local_outputs[0] is logits; the remaining outputs are KV cache
+        # entries. For hybrid models in kv_only mode (used by the generator),
+        # conv_state / recurrent_state outputs are not present, so all
+        # non-logits outputs are past_key / past_value pairs.
+        local_kv_outputs = list(local_outputs[1:])
+
         local_past_key_values = get_past_keyval_with_shift(
             past_key_vals=[],
-            new_key_vals=list(local_outputs[1:]),
+            new_key_vals=local_kv_outputs,
             length=num_valid_input_tokens,
             device=device,
         )
@@ -718,7 +744,7 @@ class LLM_Generator(GenerationMixin, torch.nn.Module):
             "past_key_values": (
                 []
                 if past_key_values is None or past_key_values.get_seq_length() == 0
-                else _dynamic_cache_to_legacy_list(past_key_values)
+                else _dynamic_cache_to_flat_list(past_key_values)
             )
         }
 
@@ -809,7 +835,7 @@ class LLM_Generator(GenerationMixin, torch.nn.Module):
             "past_key_values": (
                 []
                 if past_key_values is None or past_key_values.get_seq_length() == 0
-                else _dynamic_cache_to_legacy_list(past_key_values)
+                else _dynamic_cache_to_flat_list(past_key_values)
             )
         }
 
