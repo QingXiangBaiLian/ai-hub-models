@@ -278,6 +278,8 @@ def get_onnx_model(
     llm_io_type: LLMIOType = LLMIOType.genie_input_ids,
     use_dynamic_shapes: bool = False,
     quiet: bool = False,
+    input_spec: InputSpec | None = None,
+    output_names: list[str] | None = None,
 ) -> onnx.ModelProto | None:
     if use_dynamic_shapes:
         ensure_supported_version("torch", min_version=TORCH_DYNAMIC_SHAPE_MIN_VERSION)
@@ -298,12 +300,15 @@ def get_onnx_model(
     device = torch.device("cpu")
     fp_model.to(device)
 
-    input_specs = fp_model.get_input_spec(
-        llm_config=fp_model.llm_config.to_dict(),
-        context_length=context_length,
-        sequence_length=sequence_length,
-        llm_io_type=llm_io_type,
-    )
+    if input_spec is not None:
+        input_specs = input_spec
+    else:
+        input_specs = fp_model.get_input_spec(
+            llm_config=fp_model.llm_config.to_dict(),
+            context_length=context_length,
+            sequence_length=sequence_length,
+            llm_io_type=llm_io_type,
+        )
     if not quiet:
         print()
         if use_dynamic_shapes:
@@ -397,15 +402,52 @@ def get_onnx_model(
                 "dynamo": False,
             }
 
-        with torch.no_grad():
-            safe_torch_onnx_export(
-                fp_model,
-                tuple(example_input),
-                path,
-                input_names=list(input_specs.keys()),
-                output_names=fp_model.get_output_names(),
-                **extra,
+        _patched_cache = False
+        if input_spec is not None:
+            has_linear_attn = any(
+                k.startswith("conv_state_") or k.startswith("recurrent_state_")
+                for k in input_spec
             )
+            if has_linear_attn:
+                try:
+                    from transformers.cache_utils import LinearAttentionLayer
+
+                    _orig_update_conv = LinearAttentionLayer.update_conv_state
+                    _orig_update_rec = LinearAttentionLayer.update_recurrent_state
+
+                    def _onnx_safe_update_conv(self, conv_states, **kwargs):
+                        if not self.is_conv_states_initialized:
+                            self.lazy_initialization(conv_states=conv_states)
+                        self.conv_states = conv_states.clone()
+                        self.has_previous_state = True
+                        return self.conv_states
+
+                    def _onnx_safe_update_rec(self, recurrent_states, **kwargs):
+                        if not self.is_recurrent_states_initialized:
+                            self.lazy_initialization(recurrent_states=recurrent_states)
+                        self.recurrent_states = recurrent_states.clone()
+                        return self.recurrent_states
+
+                    LinearAttentionLayer.update_conv_state = _onnx_safe_update_conv
+                    LinearAttentionLayer.update_recurrent_state = _onnx_safe_update_rec
+                    _patched_cache = True
+                except ImportError:
+                    pass
+
+        try:
+            with torch.no_grad():
+                safe_torch_onnx_export(
+                    fp_model,
+                    tuple(example_input),
+                    path,
+                    input_names=list(input_specs.keys()),
+                    output_names=output_names if output_names is not None else fp_model.get_output_names(),
+                    **extra,
+                )
+        finally:
+            if _patched_cache:
+                LinearAttentionLayer.update_conv_state = _orig_update_conv
+                LinearAttentionLayer.update_recurrent_state = _orig_update_rec
 
         fp_model.to(old_device)
 
@@ -1299,6 +1341,7 @@ class LLMBase(BaseModel, LLMConfigEditor, ABC):
         self.model = model
         self.attention_mask_min_clip = attention_mask_min_clip
         self.attention_mask_multiplier = attention_mask_multiplier
+        self._linear_attn_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
     @staticmethod
     def get_input_spec(
@@ -1308,6 +1351,26 @@ class LLMBase(BaseModel, LLMConfigEditor, ABC):
         llm_io_type: LLMIOType = LLMIOType.genie_input_ids,
     ) -> InputSpec:
         raise NotImplementedError
+
+    @classmethod
+    def get_onnx_export_input_spec(
+        cls,
+        llm_config: dict,
+        sequence_length: int,
+        context_length: int,
+        llm_io_type: LLMIOType = LLMIOType.genie_input_ids,
+    ) -> InputSpec | None:
+        return None
+
+    @classmethod
+    def get_onnx_export_output_names(
+        cls,
+        llm_config: dict,
+        sequence_length: int,
+        context_length: int,
+        llm_io_type: LLMIOType = LLMIOType.genie_input_ids,
+    ) -> list[str] | None:
+        return None
 
     @staticmethod
     def monkey_patch(
@@ -1794,7 +1857,18 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
                     raise ValueError(
                         "The quantized checkpoint (with custom weights) must have an ONNX model."
                     )
-                # Floating model is created if not passed when from_pretrained() is called and an ONNX model doesn't exist.
+                onnx_export_input_spec = cls.get_onnx_export_input_spec(
+                    llm_config=fp_model.llm_config.to_dict(),
+                    sequence_length=sequence_length,
+                    context_length=context_length,
+                    llm_io_type=fp_model.llm_io_type,
+                )
+                onnx_export_output_names = cls.get_onnx_export_output_names(
+                    llm_config=fp_model.llm_config.to_dict(),
+                    sequence_length=sequence_length,
+                    context_length=context_length,
+                    llm_io_type=fp_model.llm_io_type,
+                )
                 onnx_model = get_onnx_model(
                     fp_model=fp_model,
                     context_length=context_length,
@@ -1803,6 +1877,8 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
                     return_model=True,
                     llm_io_type=fp_model.llm_io_type,
                     use_dynamic_shapes=use_dynamic_shapes,
+                    input_spec=onnx_export_input_spec,
+                    output_names=onnx_export_output_names,
                 )
 
             else:
@@ -2067,6 +2143,19 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
         external_weights_file = os.path.join(checkpoint, "model.data")
         onnx_file = os.path.join(checkpoint, "model.onnx")
 
+        onnx_export_input_spec = cls.get_onnx_export_input_spec(
+            llm_config=fp_model.llm_config.to_dict(),
+            sequence_length=DEFAULT_SEQUENCE_LENGTH if use_dynamic_shapes else (export_sequence_lengths[0] if export_sequence_lengths else DEFAULT_SEQUENCE_LENGTH),
+            context_length=context_length,
+            llm_io_type=llm_io_type,
+        )
+        onnx_export_output_names = cls.get_onnx_export_output_names(
+            llm_config=fp_model.llm_config.to_dict(),
+            sequence_length=DEFAULT_SEQUENCE_LENGTH if use_dynamic_shapes else (export_sequence_lengths[0] if export_sequence_lengths else DEFAULT_SEQUENCE_LENGTH),
+            context_length=context_length,
+            llm_io_type=llm_io_type,
+        )
+
         if use_dynamic_shapes:
             # Dynamic: single model_dynamic.onnx
             dynamic_onnx_model = os.path.join(checkpoint, "model_dynamic.onnx")
@@ -2080,6 +2169,8 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
                     path=onnx_file,
                     llm_io_type=llm_io_type,
                     use_dynamic_shapes=True,
+                    input_spec=onnx_export_input_spec,
+                    output_names=onnx_export_output_names,
                 )
                 shutil.move(onnx_file, dynamic_onnx_model)
         elif export_sequence_lengths is not None:
@@ -2091,12 +2182,29 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
                 if not os.path.exists(expected_onnx_model) or not os.path.exists(
                     external_weights_file
                 ):
+                    seq_input_spec = None
+                    seq_output_names = None
+                    if onnx_export_input_spec is not None:
+                        seq_input_spec = cls.get_onnx_export_input_spec(
+                            llm_config=fp_model.llm_config.to_dict(),
+                            sequence_length=seq_len,
+                            context_length=context_length,
+                            llm_io_type=llm_io_type,
+                        )
+                        seq_output_names = cls.get_onnx_export_output_names(
+                            llm_config=fp_model.llm_config.to_dict(),
+                            sequence_length=seq_len,
+                            context_length=context_length,
+                            llm_io_type=llm_io_type,
+                        )
                     get_onnx_model(
                         fp_model=fp_model,
                         context_length=context_length,
                         sequence_length=seq_len,
                         path=onnx_file,
                         llm_io_type=llm_io_type,
+                        input_spec=seq_input_spec,
+                        output_names=seq_output_names,
                     )
                     shutil.move(onnx_file, expected_onnx_model)
 

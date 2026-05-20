@@ -18,6 +18,7 @@ from qai_hub_models.models._shared.llm.model import (
 # isort: on
 import copy
 import json
+import logging
 import os
 from collections.abc import Collection
 from enum import Enum
@@ -33,13 +34,12 @@ if TYPE_CHECKING:
 import qai_hub as hub
 from packaging.version import Version
 from transformers import PretrainedConfig, PreTrainedTokenizer
+from transformers.cache_utils import DynamicCache
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.models.qwen3_5 import modeling_qwen3_5
 
 from qai_hub_models.models._shared.llm.common import LLMIOType
-from qai_hub_models.models._shared.llm.sha_dynamic_kvcache import (
-    SHADynamicCacheNewValueOnly,
-)
+from qai_hub_models.utils.aimet.config_loader import get_aimet_config_path
 from qai_hub_models.models._shared.qwen3_5.model_adaptations import (
     QcQwen3_5_apply_rotary_pos_emb,
     QCQwen3_5ForCausalLM,
@@ -142,6 +142,12 @@ class Qwen3_5Base(LLMBase):
     default_user_prompt = "What is gravity? Keep the answer under ten words."
     default_system_prompt = "You are a helpful AI assistant."
 
+    @property
+    def main_input_name(self) -> str:
+        if self.llm_io_type == LLMIOType.genie_input_embeds:
+            return "inputs_embeds"
+        return "input_ids"
+
     def edit_llm_config(self, llm_config: PretrainedConfig) -> PretrainedConfig:
         # Force float32 to avoid dtype mismatch in GatedDeltaNet conv1d.
         # The model config defaults to bfloat16, which causes issues with
@@ -205,27 +211,18 @@ class Qwen3_5Base(LLMBase):
         modeling_qwen3_5.Qwen3_5TextModel.forward = patched_qwen3_5_text_model_forward  # type: ignore[assignment, unused-ignore]
 
     def _verify_ckpt(self) -> None:
-        if self.llm_config.model_type not in ("qwen3_5_text", "qwen3_5"):
-            raise ValueError(
-                "Model config is not compatible with this model implementation."
-            )
-        architectures = self.llm_config.architectures
-        if architectures is not None and architectures[0] not in (
-            "Qwen3_5ForCausalLM",
-            "Qwen3_5ForConditionalGeneration",
+        architectures = getattr(self.llm_config, "architectures", None) or []
+        arch_ok = len(architectures) == 0 or any(
+            arch in ("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration")
+            for arch in architectures
+        )
+        if not (
+            arch_ok
+            and self.llm_config.model_type in ("qwen3_5_text", "qwen3_5")
         ):
             raise ValueError(
                 "Model config is not compatible with this model implementation."
             )
-    #def _verify_ckpt(self) -> None:
-    #    if not (
-    #        self.llm_config.architectures[0]  # type: ignore[index, unused-ignore]
-    #        in ("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration")
-    #        and self.llm_config.model_type in ("qwen3_5_text", "qwen3_5")
-    #    ):
-    #        raise ValueError(
-    #            "Model config is not compatible with this model implementation."
-    #        )
 
     def _get_layer_types(self) -> list[str]:
         """Get the layer types from config."""
@@ -297,16 +294,16 @@ class Qwen3_5Base(LLMBase):
                 f"got {len(state_tensors)}."
             )
 
-        # Build DynamicCache with proper layer structure
-        cache = SHADynamicCacheNewValueOnly(config=text_config)
+        if kv_only_mode:
+            if state_tensors[0].abs().sum() == 0:
+                self._linear_attn_cache.clear()
 
-        # Pre-populate cache with input state
+        cache = DynamicCache(config=text_config)
+
         tensor_idx = 0
         kv_tensor_idx = 0
         for layer_idx, layer_type in enumerate(layer_types):
             if layer_type == "full_attention":
-                # KV cache: past_key shape (num_kv_heads, 1, head_dim, cache_len)
-                #           past_value shape (num_kv_heads, 1, cache_len, head_dim)
                 if kv_only_mode:
                     past_key = state_tensors[kv_tensor_idx]
                     past_value = state_tensors[kv_tensor_idx + 1]
@@ -316,20 +313,16 @@ class Qwen3_5Base(LLMBase):
                     past_value = state_tensors[tensor_idx + 1]
                     tensor_idx += 2
 
-                # Convert from SHA format to standard HF format:
-                # (num_kv_heads, 1, head_dim, cache_len) -> (1, num_kv_heads, cache_len, head_dim)
                 k = past_key.permute(1, 0, 3, 2)
                 v = past_value.permute(1, 0, 2, 3)
                 cache.update(k, v, layer_idx)
             else:
                 if hybrid_mode:
-                    # Linear attention: conv_state and recurrent_state
                     conv_state = state_tensors[tensor_idx]
                     recurrent_state = state_tensors[tensor_idx + 1]
                     tensor_idx += 2
                 else:
-                    # KV-only mode: use internally saved state or zeros
-                    if hasattr(self, "_linear_attn_cache") and layer_idx in self._linear_attn_cache:
+                    if layer_idx in self._linear_attn_cache:
                         conv_state, recurrent_state = self._linear_attn_cache[layer_idx]
                     else:
                         conv_kernel_dim = linear_attn_config["linear_conv_kernel_dim"]
@@ -372,14 +365,11 @@ class Qwen3_5Base(LLMBase):
         out_cache = out["past_key_values"]
         flat_output_states: list[torch.Tensor] = []
 
-        # Save linear attention state internally for KV-only mode
         if kv_only_mode:
-            if not hasattr(self, "_linear_attn_cache"):
-                self._linear_attn_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+            self._linear_attn_cache.clear()
 
         for layer_idx, layer_type in enumerate(layer_types):
             if layer_type == "full_attention":
-                # Extract KV cache output (only new tokens)
                 if hasattr(out_cache, "key_cache"):
                     keys = out_cache.key_cache[layer_idx]
                     values = out_cache.value_cache[layer_idx]
@@ -387,24 +377,16 @@ class Qwen3_5Base(LLMBase):
                     keys = out_cache.layers[layer_idx].keys
                     values = out_cache.layers[layer_idx].values
 
-                # Convert to SHA output format:
-                # (1, num_kv_heads, seq_len, head_dim) -> (num_kv_heads, 1, head_dim, seq_len)
                 k_out = keys[:, :, -self.sequence_length:, :].permute(1, 0, 3, 2)
                 v_out = values[:, :, -self.sequence_length:, :].permute(1, 0, 2, 3)
                 flat_output_states.append(k_out)
                 flat_output_states.append(v_out)
             else:
-                # Extract linear attention state
-                if hasattr(out_cache, "conv_states"):
-                    conv_state_out = out_cache.conv_states[layer_idx]
-                    recurrent_state_out = out_cache.recurrent_states[layer_idx]
-                else:
-                    layer_cache = out_cache.layers[layer_idx]
-                    conv_state_out = layer_cache.conv_states
-                    recurrent_state_out = layer_cache.recurrent_states
+                layer_cache = out_cache.layers[layer_idx]
+                conv_state_out = layer_cache.conv_states
+                recurrent_state_out = layer_cache.recurrent_states
 
                 if kv_only_mode:
-                    # Save internally, don't include in output
                     self._linear_attn_cache[layer_idx] = (
                         conv_state_out.detach(),
                         recurrent_state_out.detach(),
@@ -468,7 +450,7 @@ class Qwen3_5Base(LLMBase):
 
         # Primary input
         if llm_io_type == LLMIOType.genie_input_embeds:
-            input_spec["input_embeds"] = ((1, sequence_length, hidden_size), "float32")
+            input_spec["inputs_embeds"] = ((1, sequence_length, hidden_size), "float32")
         else:
             input_spec["input_ids"] = ((1, sequence_length), "int32")
 
@@ -589,6 +571,29 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
             attention_mask_min_clip=attention_mask_min_clip,
             attention_mask_multiplier=attention_mask_multiplier,
         )
+        self._linear_attn_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def _get_layer_types(self) -> list[str]:
+        if hasattr(self.llm_config, "text_config"):
+            config = self.llm_config.text_config
+        else:
+            config = self.llm_config
+        return getattr(config, "layer_types", None) or ["full_attention"] * config.num_hidden_layers
+
+    def _get_text_config(self) -> PretrainedConfig:
+        if hasattr(self.llm_config, "text_config"):
+            return self.llm_config.text_config
+        return self.llm_config
+
+    def _get_linear_attn_config(self) -> dict[str, int]:
+        text_config = self._get_text_config()
+        return {
+            "linear_conv_kernel_dim": getattr(text_config, "linear_conv_kernel_dim", 4),
+            "linear_key_head_dim": getattr(text_config, "linear_key_head_dim", 128),
+            "linear_value_head_dim": getattr(text_config, "linear_value_head_dim", 128),
+            "linear_num_key_heads": getattr(text_config, "linear_num_key_heads", 16),
+            "linear_num_value_heads": getattr(text_config, "linear_num_value_heads", 16),
+        }
 
     @staticmethod
     def _get_output_names(
@@ -606,6 +611,35 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
                 output_names.append(f"conv_state_{i}_out")
                 output_names.append(f"recurrent_state_{i}_out")
         return output_names
+
+    @staticmethod
+    def _build_quantsim(
+        onnx_model: onnx.ModelProto,
+        providers: list[str | tuple[str, dict]],
+    ) -> "QuantizationSimModel":
+        from aimet_onnx import quantsim
+        from aimet_onnx.quantsim import QuantizationSimModel, QuantScheme
+        from aimet_onnx.common import quantsim as qs
+        from aimet_onnx.quantsim import AimetLogger
+
+        AimetLogger.set_level_for_all_areas(logging.WARNING)
+        default_config = get_aimet_config_path("default_config_qwen")
+        quantsim.op_types_to_tie_qtzrs = ["Concat"]
+        quantsim._tie_qtzrs = True
+        quantsim.op_outputs_to_ignore.append("Slice")
+        quantsim.op_outputs_to_ignore.append("Constant")
+        qs.encoding_version = "1.0.0"
+
+        quant_sim = QuantizationSimModel(
+            model=onnx_model,
+            param_type="int4",
+            activation_type="int16",
+            quant_scheme=QuantScheme.min_max,
+            config_file=default_config,
+            providers=providers,
+        )
+        print(f"QuantSim session providers: {quant_sim.session.get_providers()}")
+        return quant_sim
 
     @classmethod
     def prepare_genie_assets(
@@ -644,10 +678,134 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
         attention_mask: torch.Tensor,
         *rest: torch.Tensor,
     ) -> torch.Tensor | Collection[torch.Tensor]:
-        return super().forward(
-            input_tokens,
-            self.attention_mask_multiplier * attention_mask,
-            *rest,
+        attention_mask = self.attention_mask_multiplier * attention_mask
+
+        if self.quant_sim is None:
+            return super().forward(input_tokens, attention_mask, *rest)
+
+        layer_types = self._get_layer_types()
+        text_config = self._get_text_config()
+        linear_attn_config = self._get_linear_attn_config()
+        num_full_attention = sum(1 for lt in layer_types if lt == "full_attention")
+
+        if self.llm_io_type == LLMIOType.huggingface_input_ids:
+            position_ids = rest[0]
+            state_tensors = rest[1:]
+        else:
+            position_ids_cos = rest[0]
+            position_ids_sin = rest[1]
+            state_tensors = rest[2:]
+
+        kv_only_mode = len(state_tensors) == num_full_attention * 2
+
+        if not kv_only_mode:
+            return super().forward(input_tokens, attention_mask, *rest)
+
+        if state_tensors and state_tensors[0].abs().sum() == 0:
+            self._linear_attn_cache.clear()
+
+        session = self.quant_sim.session
+        onnx_input_names = [inp.name for inp in session.get_inputs()]
+        onnx_output_names = [out.name for out in session.get_outputs()]
+
+        input_dict: dict[str, torch.Tensor] = {}
+        if self.llm_io_type == LLMIOType.huggingface_input_ids:
+            input_dict["input_ids"] = input_tokens
+            input_dict["position_ids"] = position_ids
+        else:
+            input_dict["input_ids"] = input_tokens
+            input_dict["position_ids_cos"] = position_ids_cos
+            input_dict["position_ids_sin"] = position_ids_sin
+        input_dict["attention_mask"] = attention_mask
+
+        kv_tensor_idx = 0
+        for i, layer_type in enumerate(layer_types):
+            if layer_type == "full_attention":
+                input_dict[f"past_key_{i}_in"] = state_tensors[kv_tensor_idx]
+                input_dict[f"past_value_{i}_in"] = state_tensors[kv_tensor_idx + 1]
+                kv_tensor_idx += 2
+            else:
+                if i in self._linear_attn_cache:
+                    conv_state, recurrent_state = self._linear_attn_cache[i]
+                    input_dict[f"conv_state_{i}_in"] = conv_state.to(input_tokens.device)
+                    input_dict[f"recurrent_state_{i}_in"] = recurrent_state.to(input_tokens.device)
+                else:
+                    conv_kernel_dim = linear_attn_config["linear_conv_kernel_dim"]
+                    key_dim = (
+                        linear_attn_config["linear_num_key_heads"]
+                        * linear_attn_config["linear_key_head_dim"]
+                    )
+                    value_dim = (
+                        linear_attn_config["linear_num_value_heads"]
+                        * linear_attn_config["linear_value_head_dim"]
+                    )
+                    conv_dim = key_dim * 2 + value_dim
+                    num_v_heads = linear_attn_config["linear_num_value_heads"]
+                    k_head_dim = linear_attn_config["linear_key_head_dim"]
+                    v_head_dim = linear_attn_config["linear_value_head_dim"]
+
+                    input_dict[f"conv_state_{i}_in"] = torch.zeros(
+                        1, conv_dim, conv_kernel_dim - 1,
+                        device=input_tokens.device, dtype=torch.float32,
+                    )
+                    input_dict[f"recurrent_state_{i}_in"] = torch.zeros(
+                        1, num_v_heads, k_head_dim, v_head_dim,
+                        device=input_tokens.device, dtype=torch.float32,
+                    )
+
+        onnx_input_feed = {}
+        for name in onnx_input_names:
+            if name in input_dict:
+                onnx_input_feed[name] = input_dict[name].cpu().detach().numpy()
+            else:
+                onnx_input_feed[name] = torch.zeros(
+                    [d.dim_value for d in next(inp for inp in session.get_inputs() if inp.name == name).type.tensor_type.shape.dim],
+                    dtype=torch.float32,
+                ).numpy()
+
+        output_np = session.run(None, onnx_input_feed)
+        output_dict = dict(zip(onnx_output_names, output_np))
+
+        result: list[torch.Tensor] = [torch.from_numpy(output_dict["logits"])]
+
+        for i, layer_type in enumerate(layer_types):
+            if layer_type == "full_attention":
+                result.append(torch.from_numpy(output_dict[f"past_key_{i}_out"]))
+                result.append(torch.from_numpy(output_dict[f"past_value_{i}_out"]))
+            else:
+                conv_out = torch.from_numpy(output_dict[f"conv_state_{i}_out"]).detach()
+                rec_out = torch.from_numpy(output_dict[f"recurrent_state_{i}_out"]).detach()
+                self._linear_attn_cache[i] = (conv_out.cpu(), rec_out.cpu())
+
+        return result
+
+    @classmethod
+    def get_onnx_export_input_spec(
+        cls,
+        llm_config: dict,
+        sequence_length: int,
+        context_length: int,
+        llm_io_type: LLMIOType = LLMIOType.genie_input_ids,
+    ) -> InputSpec | None:
+        return cls.get_input_spec(
+            llm_config=llm_config,
+            sequence_length=sequence_length,
+            context_length=context_length,
+            llm_io_type=llm_io_type,
+        )
+
+    @classmethod
+    def get_onnx_export_output_names(
+        cls,
+        llm_config: dict,
+        sequence_length: int,
+        context_length: int,
+        llm_io_type: LLMIOType = LLMIOType.genie_input_ids,
+    ) -> list[str] | None:
+        from qai_hub_models.models.qwen3_5_0_8b.model import LAYER_TYPES
+        return cls._get_output_names(
+            num_hidden_layers=llm_config.get("num_hidden_layers", 24),
+            layer_types=LAYER_TYPES,
         )
 
     def _adapt_aimet_encodings(

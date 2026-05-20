@@ -28,9 +28,6 @@ from qai_hub_models.models._shared.llm.model_adaptations import (
     ConvInplaceLinear,
     repeat_kv,
 )
-from qai_hub_models.models._shared.llm.sha_dynamic_kvcache import (
-    SHADynamicCacheNewValueOnly,
-)
 
 
 def _apply_rope_single_partial(
@@ -315,8 +312,6 @@ class SHAQwen3_5Attention(Qwen3_5Attention):
         ]
 
         kv_seq_len = value_states[0].shape[-2]
-        if past_key_values is not None:
-            kv_seq_len += past_key_values.layers[self.layer_idx].values.shape[-2]
 
         assert position_embeddings is not None
         # Apply partial rotary embeddings
@@ -334,25 +329,21 @@ class SHAQwen3_5Attention(Qwen3_5Attention):
                 key_state.transpose(2, 3) for key_state in key_states
             ]
 
+            stacked_keys = torch.cat(transposed_key_states, dim=1).transpose(-1, -2)
+            stacked_values = torch.cat(value_states, dim=1)
+
             cos, sin = position_embeddings
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            past_key_values.update(
-                torch.cat(key_states, dim=1),
-                torch.cat(value_states, dim=1),
+            full_keys, full_values = past_key_values.update(
+                stacked_keys,
+                stacked_values,
                 self.layer_idx,
                 cache_kwargs,
             )
 
-            past_key = past_key_values.layers[self.layer_idx].keys
-            past_value = past_key_values.layers[self.layer_idx].values
-            key_states = [
-                past_key[:, i, :, :].unsqueeze(1).transpose(2, 3)
-                for i in range(past_key.shape[1])
-            ]
-            value_states = [
-                past_value[:, i, :, :].unsqueeze(1)
-                for i in range(past_value.shape[1])
-            ]
+            key_states = list(full_keys.transpose(-1, -2).split(1, dim=1))
+            value_states = list(full_values.split(1, dim=1))
+            kv_seq_len = full_values.shape[-2]
         else:
             key_states = [
                 key_state.transpose(2, 3) for key_state in key_states
