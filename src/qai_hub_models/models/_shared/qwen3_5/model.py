@@ -57,7 +57,7 @@ MODEL_ASSET_VERSION = 1
 
 # Configs
 AIMET_ENCODINGS_PREFIX = "config"
-AIMET_CONFIG = "default_config_qwen"
+AIMET_CONFIG = "default_config_qwen35"
 
 DATA_DIR = "data"
 USE_CACHED_DATA = True
@@ -538,7 +538,7 @@ class Qwen3_5PositionProcessor(PositionProcessorBase):
             key_value_length=attention_mask_before_processor.shape[1],
             dtype=torch.float32,
         )
-        attention_mask = attention_mask.clip(-50, 0)
+        attention_mask = attention_mask.clip(-1000, 0)
         return attention_mask, position_ids_cos, position_ids_sin
 
 
@@ -547,6 +547,13 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
     FPModel = Qwen3_5Base
 
     ada_scale_model_type: str | None = "qwen3_5"
+
+    @classmethod
+    def attention_mask_min_clip_and_multiplier(
+        cls,
+        precision: Precision,
+    ) -> tuple[float | None, float]:
+        return (-1000.0, 1.0)
 
     def __init__(
         self,
@@ -623,7 +630,7 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
         from aimet_onnx.quantsim import AimetLogger
 
         AimetLogger.set_level_for_all_areas(logging.WARNING)
-        default_config = get_aimet_config_path("default_config_qwen")
+        default_config = get_aimet_config_path("default_config_qwen35")
         quantsim.op_types_to_tie_qtzrs = ["Concat"]
         quantsim._tie_qtzrs = True
         quantsim.op_outputs_to_ignore.append("Slice")
@@ -640,6 +647,95 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
         )
         print(f"QuantSim session providers: {quant_sim.session.get_providers()}")
         return quant_sim
+
+    @classmethod
+    def _configure_quant_sim(
+        cls, quant_sim: "QuantizationSimModel", precision: Precision
+    ) -> "QuantizationSimModel":
+        from aimet_onnx.common.defs import QuantizationDataType
+        from qai_hub_models.models._shared.llm._utils import (
+            _apply_int8_kv_cache_tying_and_lm_head,
+            _get_kv_io_map,
+            _set_lm_head_to_8b,
+        )
+
+        if precision == Precision.w4a16:
+            kv_io_map = _get_kv_io_map(quant_sim)
+            quant_sim = _apply_int8_kv_cache_tying_and_lm_head(quant_sim, kv_io_map)
+            cls._set_mamba_states_to_float16(quant_sim)
+        elif precision == Precision.w4:
+            _set_lm_head_to_8b(quant_sim)
+            cls._set_mamba_states_to_float16(quant_sim)
+            for op_name, qc_op in quant_sim.qc_quantize_op_dict.items():
+                if op_name in quant_sim.activation_names:
+                    qc_op.reset_encoding_stats()
+                    qc_op.data_type = QuantizationDataType.float
+                    qc_op.bitwidth = 16
+        return quant_sim
+
+    @staticmethod
+    def _set_mamba_states_to_float16(quant_sim: "QuantizationSimModel") -> None:
+        from aimet_onnx.common.defs import QuantizationDataType
+
+        mamba_state_names = set()
+        for inp in quant_sim.model.graph().input:
+            if "conv_state" in inp.name or "recurrent_state" in inp.name:
+                mamba_state_names.add(inp.name)
+        for out in quant_sim.model.graph().output:
+            name = out.name.replace("_updated", "")
+            if "conv_state" in name or "recurrent_state" in name:
+                mamba_state_names.add(name)
+
+        for name in mamba_state_names:
+            quantizer = quant_sim.qc_quantize_op_dict.get(name)
+            if quantizer is not None and quantizer.enabled:
+                quantizer.reset_encoding_stats()
+                quantizer.data_type = QuantizationDataType.float
+                quantizer.bitwidth = 16
+
+    def _dataloader_to_numpy(
+        self, data, num_batches: int
+    ) -> list[dict[str, Any]]:
+        import numpy as np
+        from tqdm import tqdm
+        import itertools
+        from qai_hub_models.utils.runtime_torch_wrapper import kwargs_to_dict
+
+        assert self.quant_sim is not None
+        session = self.quant_sim.session
+        input_infos = {
+            inp.name: inp
+            for inp in session.get_inputs()
+        }
+        input_names = list(input_infos.keys())
+
+        mamba_state_inputs = {
+            name for name in input_names
+            if "conv_state" in name or "recurrent_state" in name
+        }
+        non_mamba_names = [n for n in input_names if n not in mamba_state_inputs]
+
+        mamba_state_shapes = {}
+        for name in mamba_state_inputs:
+            mamba_state_shapes[name] = [
+                d if isinstance(d, int) else 1 for d in input_infos[name].shape
+            ]
+
+        onnx_data = []
+        n = min(len(data), num_batches)
+        for batch in tqdm(itertools.islice(data, n), total=n):
+            batch_list = list(batch)
+            provided = kwargs_to_dict(non_mamba_names, *batch_list)
+
+            entry: dict[str, Any] = {}
+            for name in input_names:
+                if name in mamba_state_inputs:
+                    entry[name] = np.zeros(mamba_state_shapes[name], dtype=np.float32)
+                else:
+                    entry[name] = provided[name].cpu().detach().numpy()
+
+            onnx_data.append(entry)
+        return onnx_data
 
     @classmethod
     def prepare_genie_assets(
@@ -707,7 +803,8 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
         session = self.quant_sim.session
         onnx_input_names = [inp.name for inp in session.get_inputs()]
         onnx_output_names = [out.name for out in session.get_outputs()]
-
+        print("ONNX input names:", onnx_input_names)
+        print("ONNX output names:", onnx_output_names)
         input_dict: dict[str, torch.Tensor] = {}
         if self.llm_io_type == LLMIOType.huggingface_input_ids:
             input_dict["input_ids"] = input_tokens
