@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import tempfile
 import warnings
@@ -124,6 +125,73 @@ try:
     )
 
     AIMET_ONNX_INSTALLED = True
+
+    def _load_encodings_with_fallback(
+        quant_sim: "QuantizationSimModel",
+        encodings_path: str,
+    ) -> None:
+        import json
+        import tempfile
+
+        try:
+            load_encodings_to_sim(quant_sim, encodings_path, strict=False)
+        except AssertionError as e:
+            if "encoding names were present" not in str(e):
+                raise
+
+            print(
+                "WARNING: Some encoding names in the encodings file do not match "
+                "the model. Filtering out mismatched encodings and retrying."
+            )
+
+            all_products = quant_sim.connected_graph.get_all_products()
+            all_quantizers = set(quant_sim.qc_quantize_op_dict.keys())
+
+            with open(encodings_path) as f:
+                encodings = json.load(f)
+
+            original_param_count = len(encodings.get("param_encodings", []))
+            original_act_count = len(encodings.get("activation_encodings", []))
+
+            filtered_param = []
+            for enc in encodings.get("param_encodings", []):
+                name = enc["name"] if isinstance(enc, dict) else enc
+                if name in all_quantizers or name in all_products:
+                    filtered_param.append(enc)
+                else:
+                    print(f"  Skipping param encoding: {name}")
+
+            filtered_act = []
+            for enc in encodings.get("activation_encodings", []):
+                name = enc["name"] if isinstance(enc, dict) else enc
+                if name in all_quantizers or name in all_products:
+                    filtered_act.append(enc)
+                else:
+                    print(f"  Skipping activation encoding: {name}")
+
+            encodings["param_encodings"] = filtered_param
+            encodings["activation_encodings"] = filtered_act
+
+            print(
+                f"  Param encodings: {original_param_count} -> {len(filtered_param)} "
+                f"(removed {original_param_count - len(filtered_param)})"
+            )
+            print(
+                f"  Activation encodings: {original_act_count} -> {len(filtered_act)} "
+                f"(removed {original_act_count - len(filtered_act)})"
+            )
+
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".encodings", delete=False
+            ) as tmp:
+                json.dump(encodings, tmp)
+                tmp_path = tmp.name
+
+            try:
+                load_encodings_to_sim(quant_sim, tmp_path, strict=False)
+            finally:
+                os.remove(tmp_path)
+
 except (ImportError, ModuleNotFoundError):
     print(
         "Quantized models require the AIMET-ONNX package, which is only supported on Linux. "
@@ -1759,6 +1827,7 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
                 sequence_length=self.sequence_length,
                 context_length=self.context_length,
                 llm_config=self.llm_config.to_dict(),
+                llm_io_type=self.llm_io_type,
             )
         assert self.FPModel is not None
         return sample_input(
@@ -1852,6 +1921,30 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
                         os.path.exists(onnx_path) and external_data_exists
                     )
 
+                    if not onnx_file_exists and external_data_exists:
+                        available_onnx = sorted(
+                            glob.glob(
+                                os.path.join(
+                                    checkpoint,
+                                    f"model_seqlen{sequence_length}_cl*.onnx",
+                                )
+                            )
+                        )
+                        if available_onnx:
+                            onnx_path = available_onnx[0]
+                            onnx_file_exists = True
+                            match = re.search(
+                                r"_cl(\d+)\.onnx$", onnx_path
+                            )
+                            if match:
+                                detected_cl = int(match.group(1))
+                                print()
+                                print(
+                                    f"Requested context_length={context_length} not found in checkpoint. "
+                                    f"Using available context_length={detected_cl} from {os.path.basename(onnx_path)}."
+                                )
+                                context_length = detected_cl
+
             if not onnx_file_exists:
                 if fp_model is None:
                     raise ValueError(
@@ -1926,7 +2019,7 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
                         f"Loading the encodings from path {checkpoint} to load the QuantSim model."
                     )
                     _fix_unsupported_channel_axis(quant_sim)
-                    load_encodings_to_sim(quant_sim, aimet_encodings, strict=False)
+                    _load_encodings_with_fallback(quant_sim, aimet_encodings)
         else:
             quant_sim = None
 

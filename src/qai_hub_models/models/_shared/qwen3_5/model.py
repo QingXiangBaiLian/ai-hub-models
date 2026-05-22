@@ -137,8 +137,8 @@ class Qwen3_5RopeEmbedding:
 class Qwen3_5Base(LLMBase):
     LMClass = modeling_qwen3_5.Qwen3_5ForCausalLM
     EmbeddingClass = Qwen3_5RopeEmbedding
+    llm_io_type = LLMIOType.genie_input_embeds
 
-    # Default prompts for demos
     default_user_prompt = "What is gravity? Keep the answer under ten words."
     default_system_prompt = "You are a helpful AI assistant."
 
@@ -619,10 +619,23 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
                 output_names.append(f"recurrent_state_{i}_out")
         return output_names
 
+    @classmethod
+    def create_quantsim(
+        cls,
+        onnx_model: onnx.ModelProto,
+        host_device: torch.device,
+        precision: Precision,
+    ) -> "QuantizationSimModel":
+        quant_sim = cls._build_quantsim(
+            onnx_model, cls.get_ort_providers(host_device), precision
+        )
+        return cls._configure_quant_sim(quant_sim, precision)
+
     @staticmethod
     def _build_quantsim(
         onnx_model: onnx.ModelProto,
         providers: list[str | tuple[str, dict]],
+        precision: Precision = Precision.w4a16,
     ) -> "QuantizationSimModel":
         from aimet_onnx import quantsim
         from aimet_onnx.quantsim import QuantizationSimModel, QuantScheme
@@ -637,9 +650,14 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
         quantsim.op_outputs_to_ignore.append("Constant")
         qs.encoding_version = "1.0.0"
 
+        if precision == Precision.w8a16:
+            param_type = "int8"
+        else:
+            param_type = "int4"
+
         quant_sim = QuantizationSimModel(
             model=onnx_model,
-            param_type="int4",
+            param_type=param_type,
             activation_type="int16",
             quant_scheme=QuantScheme.min_max,
             config_file=default_config,
@@ -659,13 +677,19 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
             _set_lm_head_to_8b,
         )
 
-        if precision == Precision.w4a16:
+        if precision == Precision.w8a16:
             kv_io_map = _get_kv_io_map(quant_sim)
             quant_sim = _apply_int8_kv_cache_tying_and_lm_head(quant_sim, kv_io_map)
             cls._set_mamba_states_to_float16(quant_sim)
+        elif precision == Precision.w4a16:
+            kv_io_map = _get_kv_io_map(quant_sim)
+            quant_sim = _apply_int8_kv_cache_tying_and_lm_head(quant_sim, kv_io_map)
+            cls._set_mamba_states_to_float16(quant_sim)
+            cls._set_int4_weights_to_per_block(quant_sim, block_size=32)
         elif precision == Precision.w4:
             _set_lm_head_to_8b(quant_sim)
             cls._set_mamba_states_to_float16(quant_sim)
+            cls._set_int4_weights_to_per_block(quant_sim, block_size=32)
             for op_name, qc_op in quant_sim.qc_quantize_op_dict.items():
                 if op_name in quant_sim.activation_names:
                     qc_op.reset_encoding_stats()
@@ -692,6 +716,20 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
                 quantizer.reset_encoding_stats()
                 quantizer.data_type = QuantizationDataType.float
                 quantizer.bitwidth = 16
+
+    @staticmethod
+    def _set_int4_weights_to_per_block(
+        quant_sim: "QuantizationSimModel", block_size: int = 32
+    ) -> None:
+        from aimet_onnx.quantsim import set_blockwise_quantization_for_weights
+
+        set_blockwise_quantization_for_weights(
+            sim=quant_sim,
+            op_types=("Conv", "Gemm", "MatMul"),
+            bitwidth=4,
+            symmetric=True,
+            block_size=block_size,
+        )
 
     def _dataloader_to_numpy(
         self, data, num_batches: int
@@ -803,12 +841,14 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
         session = self.quant_sim.session
         onnx_input_names = [inp.name for inp in session.get_inputs()]
         onnx_output_names = [out.name for out in session.get_outputs()]
-        print("ONNX input names:", onnx_input_names)
-        print("ONNX output names:", onnx_output_names)
         input_dict: dict[str, torch.Tensor] = {}
         if self.llm_io_type == LLMIOType.huggingface_input_ids:
             input_dict["input_ids"] = input_tokens
             input_dict["position_ids"] = position_ids
+        elif self.llm_io_type == LLMIOType.genie_input_embeds:
+            input_dict["inputs_embeds"] = input_tokens
+            input_dict["position_ids_cos"] = position_ids_cos
+            input_dict["position_ids_sin"] = position_ids_sin
         else:
             input_dict["input_ids"] = input_tokens
             input_dict["position_ids_cos"] = position_ids_cos
@@ -855,23 +895,36 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
             if name in input_dict:
                 onnx_input_feed[name] = input_dict[name].cpu().detach().numpy()
             else:
+                inp_info = next(inp for inp in session.get_inputs() if inp.name == name)
+                shape = [d if isinstance(d, int) else 1 for d in inp_info.shape]
                 onnx_input_feed[name] = torch.zeros(
-                    [d.dim_value for d in next(inp for inp in session.get_inputs() if inp.name == name).type.tensor_type.shape.dim],
+                    shape,
                     dtype=torch.float32,
                 ).numpy()
 
         output_np = session.run(None, onnx_input_feed)
         output_dict = dict(zip(onnx_output_names, output_np))
 
-        result: list[torch.Tensor] = [torch.from_numpy(output_dict["logits"])]
+        def _get_output(name: str):
+            if name in output_dict:
+                return output_dict[name]
+            updated_name = name + "_updated"
+            if updated_name in output_dict:
+                return output_dict[updated_name]
+            raise KeyError(f"Output '{name}' not found in model outputs. Available: {list(output_dict.keys())}")
+
+        result: list[torch.Tensor] = [torch.from_numpy(_get_output("logits"))]
 
         for i, layer_type in enumerate(layer_types):
             if layer_type == "full_attention":
-                result.append(torch.from_numpy(output_dict[f"past_key_{i}_out"]))
-                result.append(torch.from_numpy(output_dict[f"past_value_{i}_out"]))
+                result.append(torch.from_numpy(_get_output(f"past_key_{i}_out")))
+                result.append(torch.from_numpy(_get_output(f"past_value_{i}_out")))
             else:
-                conv_out = torch.from_numpy(output_dict[f"conv_state_{i}_out"]).detach()
-                rec_out = torch.from_numpy(output_dict[f"recurrent_state_{i}_out"]).detach()
+                conv_out = torch.from_numpy(_get_output(f"conv_state_{i}_out")).detach()
+                rec_out = torch.from_numpy(_get_output(f"recurrent_state_{i}_out")).detach()
+                conv_kernel_dim = linear_attn_config["linear_conv_kernel_dim"]
+                if conv_out.shape[2] > conv_kernel_dim - 1:
+                    conv_out = conv_out[:, :, -(conv_kernel_dim - 1):]
                 self._linear_attn_cache[i] = (conv_out.cpu(), rec_out.cpu())
 
         return result

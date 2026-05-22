@@ -781,21 +781,28 @@ class AIMETOnnxQuantizableMixin(PretrainedHubModelProtocol):
 
         initializers = {init.name: init for init in model.graph.initializer}
 
+        qdq_output_to_input = {}
+        for node in model.graph.node:
+            if node.op_type == "QcQuantizeOp" and len(node.input) >= 1 and len(node.output) >= 1:
+                qdq_output_to_input[node.output[0]] = node.input[0]
+
         weight_entries = []
         for node in model.graph.node:
             if node.op_type == "MatMul" and len(node.input) >= 2:
-                weight_name = node.input[1]
-                if weight_name in initializers:
-                    weight = numpy_helper.to_array(initializers[weight_name])
+                weight_input = node.input[1]
+                original_name = qdq_output_to_input.get(weight_input, weight_input)
+                if original_name in initializers:
+                    weight = numpy_helper.to_array(initializers[original_name])
                     if weight.ndim == 2 and weight.shape[0] >= 16 and weight.shape[1] >= 16:
-                        weight_entries.append((weight_name, weight, "matmul"))
+                        weight_entries.append((original_name, weight, "matmul"))
             elif node.op_type == "Conv" and len(node.input) >= 2:
-                weight_name = node.input[1]
-                if weight_name in initializers:
-                    weight = numpy_helper.to_array(initializers[weight_name])
+                weight_input = node.input[1]
+                original_name = qdq_output_to_input.get(weight_input, weight_input)
+                if original_name in initializers:
+                    weight = numpy_helper.to_array(initializers[original_name])
                     if weight.ndim == 4 and weight.shape[2:] == (1, 1) and weight.shape[0] >= 16 and weight.shape[1] >= 16:
                         weight_2d = weight.reshape(weight.shape[0], -1)
-                        weight_entries.append((weight_name, weight_2d, "conv"))
+                        weight_entries.append((original_name, weight_2d, "conv"))
 
         if not weight_entries:
             print("SpinQuant: No eligible weights found, skipping")

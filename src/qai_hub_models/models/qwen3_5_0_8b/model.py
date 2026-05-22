@@ -73,7 +73,7 @@ MODEL_ID = __name__.split(".")[-2]
 MODEL_ASSET_VERSION = 1
 MIN_MEMORY_RECOMMENDED = 40
 DEFAULT_PRECISION = Precision.w4a16
-SUPPORTED_PRECISIONS = [Precision.w4a16, Precision.w4]
+SUPPORTED_PRECISIONS = [Precision.w4a16, Precision.w4, Precision.w8a16]
 DEFAULT_CHECKPOINT: dict[Precision, str] = {}
 
 
