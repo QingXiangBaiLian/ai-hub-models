@@ -25,7 +25,6 @@ import json
 import logging
 import math
 import os
-import re
 import shutil
 import tempfile
 import warnings
@@ -121,77 +120,9 @@ try:
     )
     from qai_hub_models.utils.quantization_aimet_onnx import (
         ensure_min_aimet_onnx_version,
-        _fix_unsupported_channel_axis,
     )
 
     AIMET_ONNX_INSTALLED = True
-
-    def _load_encodings_with_fallback(
-        quant_sim: "QuantizationSimModel",
-        encodings_path: str,
-    ) -> None:
-        import json
-        import tempfile
-
-        try:
-            load_encodings_to_sim(quant_sim, encodings_path, strict=False)
-        except AssertionError as e:
-            if "encoding names were present" not in str(e):
-                raise
-
-            print(
-                "WARNING: Some encoding names in the encodings file do not match "
-                "the model. Filtering out mismatched encodings and retrying."
-            )
-
-            all_products = quant_sim.connected_graph.get_all_products()
-            all_quantizers = set(quant_sim.qc_quantize_op_dict.keys())
-
-            with open(encodings_path) as f:
-                encodings = json.load(f)
-
-            original_param_count = len(encodings.get("param_encodings", []))
-            original_act_count = len(encodings.get("activation_encodings", []))
-
-            filtered_param = []
-            for enc in encodings.get("param_encodings", []):
-                name = enc["name"] if isinstance(enc, dict) else enc
-                if name in all_quantizers or name in all_products:
-                    filtered_param.append(enc)
-                else:
-                    print(f"  Skipping param encoding: {name}")
-
-            filtered_act = []
-            for enc in encodings.get("activation_encodings", []):
-                name = enc["name"] if isinstance(enc, dict) else enc
-                if name in all_quantizers or name in all_products:
-                    filtered_act.append(enc)
-                else:
-                    print(f"  Skipping activation encoding: {name}")
-
-            encodings["param_encodings"] = filtered_param
-            encodings["activation_encodings"] = filtered_act
-
-            print(
-                f"  Param encodings: {original_param_count} -> {len(filtered_param)} "
-                f"(removed {original_param_count - len(filtered_param)})"
-            )
-            print(
-                f"  Activation encodings: {original_act_count} -> {len(filtered_act)} "
-                f"(removed {original_act_count - len(filtered_act)})"
-            )
-
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".encodings", delete=False
-            ) as tmp:
-                json.dump(encodings, tmp)
-                tmp_path = tmp.name
-
-            try:
-                load_encodings_to_sim(quant_sim, tmp_path, strict=False)
-            finally:
-                os.remove(tmp_path)
-
 except (ImportError, ModuleNotFoundError):
     print(
         "Quantized models require the AIMET-ONNX package, which is only supported on Linux. "
@@ -346,13 +277,8 @@ def get_onnx_model(
     llm_io_type: LLMIOType = LLMIOType.genie_input_ids,
     use_dynamic_shapes: bool = False,
     quiet: bool = False,
-    input_spec: InputSpec | None = None,
-    output_names: list[str] | None = None,
 ) -> onnx.ModelProto | None:
-    if use_dynamic_shapes:
-        ensure_supported_version("torch", min_version=TORCH_DYNAMIC_SHAPE_MIN_VERSION)
-    else:
-        ensure_supported_version("torch", min_version="2.4.1", below_version="2.9")
+    ensure_supported_version("torch", min_version=TORCH_DYNAMIC_SHAPE_MIN_VERSION)
 
     # Create the checkpoint directory if it does not exist.
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -368,15 +294,12 @@ def get_onnx_model(
     device = torch.device("cpu")
     fp_model.to(device)
 
-    if input_spec is not None:
-        input_specs = input_spec
-    else:
-        input_specs = fp_model.get_input_spec(
-            llm_config=fp_model.llm_config.to_dict(),
-            context_length=context_length,
-            sequence_length=sequence_length,
-            llm_io_type=llm_io_type,
-        )
+    input_specs = fp_model.get_input_spec(
+        llm_config=fp_model.llm_config.to_dict(),
+        context_length=context_length,
+        sequence_length=sequence_length,
+        llm_io_type=llm_io_type,
+    )
     if not quiet:
         print()
         if use_dynamic_shapes:
@@ -388,8 +311,6 @@ def get_onnx_model(
                 f"Exporting ONNX model with sequence length {sequence_length} and context length {context_length}. This could take around 10 minutes."
             )
 
-    what = [input_specs[name][0] for name in input_specs]
-    print("=====", what)
     example_input = [
         torch.zeros(
             input_specs[name][0], dtype=getattr(torch, input_specs[name][1])
@@ -454,77 +375,59 @@ def get_onnx_model(
         )
 
     try:
-        # Names were changed in 2.9, which could ruin cached .onnx files.
-        # This is no longer an issue with 2.10+ dynamo export.
-        extra = {}
+        # Always use dynamo export (legacy torchscript exporter can't handle
+        # aten::copy on torch 2.9+). With use_dynamic_shapes we pass
+        # dynamic_shapes; without it each model is traced at fixed seq_len.
+        extra: dict[str, Any] = {
+            "opset_version": 18,
+            "dynamo": True,
+            "optimize": False,
+        }
         if use_dynamic_shapes:
-            extra = {
-                "opset_version": 18,
-                "dynamo": True,
-                "optimize": True,
-                "dynamic_shapes": dynamic_shapes,
-            }
-        else:
-            extra = {
-                "opset_version": 17,
-                "dynamo": False,
-            }
+            extra["dynamic_shapes"] = dynamic_shapes
 
-        _patched_cache = False
-        if input_spec is not None:
-            has_linear_attn = any(
-                k.startswith("conv_state_") or k.startswith("recurrent_state_")
-                for k in input_spec
+        with torch.no_grad():
+            safe_torch_onnx_export(
+                fp_model,
+                tuple(example_input),
+                path,
+                input_names=list(input_specs.keys()),
+                output_names=fp_model._get_output_names(
+                    fp_model.llm_config.num_hidden_layers
+                ),
+                **extra,
             )
-            if has_linear_attn:
-                try:
-                    from transformers.cache_utils import LinearAttentionLayer
-
-                    _orig_update_conv = LinearAttentionLayer.update_conv_state
-                    _orig_update_rec = LinearAttentionLayer.update_recurrent_state
-
-                    def _onnx_safe_update_conv(self, conv_states, **kwargs):
-                        if not self.is_conv_states_initialized:
-                            self.lazy_initialization(conv_states=conv_states)
-                        self.conv_states = conv_states.clone()
-                        self.has_previous_state = True
-                        return self.conv_states
-
-                    def _onnx_safe_update_rec(self, recurrent_states, **kwargs):
-                        if not self.is_recurrent_states_initialized:
-                            self.lazy_initialization(recurrent_states=recurrent_states)
-                        self.recurrent_states = recurrent_states.clone()
-                        return self.recurrent_states
-
-                    LinearAttentionLayer.update_conv_state = _onnx_safe_update_conv
-                    LinearAttentionLayer.update_recurrent_state = _onnx_safe_update_rec
-                    _patched_cache = True
-                except ImportError:
-                    pass
-
-        try:
-            with torch.no_grad():
-                safe_torch_onnx_export(
-                    fp_model,
-                    tuple(example_input),
-                    path,
-                    input_names=list(input_specs.keys()),
-                    output_names=output_names if output_names is not None else fp_model.get_output_names(),
-                    **extra,
-                )
-        finally:
-            if _patched_cache:
-                LinearAttentionLayer.update_conv_state = _orig_update_conv
-                LinearAttentionLayer.update_recurrent_state = _orig_update_rec
 
         fp_model.to(old_device)
 
         onnx_model = onnx.load(path)
-        # Clean up multiple weights files
-        for file in glob.glob(os.path.join(os.path.dirname(path), "*.weight")):
-            os.remove(file)
-        for file in glob.glob(os.path.join(os.path.dirname(path), "onnx__*")):
-            os.remove(file)
+
+        # Normalize the ONNX graph for onnxruntime compatibility
+        # (the onnxscript optimizer hangs on hybrid attention models, so we
+        # run only inline + structural cleanup via IR)
+        import onnx_ir
+        from onnx_ir import passes as ir_passes
+        from onnxscript.optimizer import common_passes
+
+        ir_model = onnx_ir.from_proto(onnx_model)
+        del onnx_model
+
+        targeted_passes = ir_passes.Sequential(
+            common_passes.InlinePass(),
+            common_passes.RemoveUnusedNodesPass(),
+            common_passes.RemoveUnusedFunctionsPass(),
+            common_passes.RemoveUnusedOpsetsPass(),
+            common_passes.LiftConstantsToInitializersPass(
+                lift_all_constants=True, size_limit=0
+            ),
+            common_passes.LiftSubgraphInitializersToMainGraphPass(),
+            common_passes.DeduplicateInitializersPass(),
+            common_passes.OutputFixPass(),
+            common_passes.NameFixPass(),
+        )
+        targeted_passes(ir_model)
+        onnx_model = onnx_ir.to_proto(ir_model)
+        del ir_model
 
         onnx.save_model(
             onnx_model,
@@ -1409,7 +1312,6 @@ class LLMBase(BaseModel, LLMConfigEditor, ABC):
         self.model = model
         self.attention_mask_min_clip = attention_mask_min_clip
         self.attention_mask_multiplier = attention_mask_multiplier
-        self._linear_attn_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
     @staticmethod
     def get_input_spec(
@@ -1419,26 +1321,6 @@ class LLMBase(BaseModel, LLMConfigEditor, ABC):
         llm_io_type: LLMIOType = LLMIOType.genie_input_ids,
     ) -> InputSpec:
         raise NotImplementedError
-
-    @classmethod
-    def get_onnx_export_input_spec(
-        cls,
-        llm_config: dict,
-        sequence_length: int,
-        context_length: int,
-        llm_io_type: LLMIOType = LLMIOType.genie_input_ids,
-    ) -> InputSpec | None:
-        return None
-
-    @classmethod
-    def get_onnx_export_output_names(
-        cls,
-        llm_config: dict,
-        sequence_length: int,
-        context_length: int,
-        llm_io_type: LLMIOType = LLMIOType.genie_input_ids,
-    ) -> list[str] | None:
-        return None
 
     @staticmethod
     def monkey_patch(
@@ -1466,12 +1348,6 @@ class LLMBase(BaseModel, LLMConfigEditor, ABC):
             output_names.append(f"past_key_{layer}_out")
             output_names.append(f"past_value_{layer}_out")
         return output_names
-
-    @staticmethod
-    def get_output_names() -> list[str]:
-        raise NotImplementedError(
-            "Subclasses must implement get_output_names()"
-        )
 
     # Must be defined by transformers generator class
     @property
@@ -1827,7 +1703,6 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
                 sequence_length=self.sequence_length,
                 context_length=self.context_length,
                 llm_config=self.llm_config.to_dict(),
-                llm_io_type=self.llm_io_type,
             )
         assert self.FPModel is not None
         return sample_input(
@@ -1921,47 +1796,12 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
                         os.path.exists(onnx_path) and external_data_exists
                     )
 
-                    if not onnx_file_exists and external_data_exists:
-                        available_onnx = sorted(
-                            glob.glob(
-                                os.path.join(
-                                    checkpoint,
-                                    f"model_seqlen{sequence_length}_cl*.onnx",
-                                )
-                            )
-                        )
-                        if available_onnx:
-                            onnx_path = available_onnx[0]
-                            onnx_file_exists = True
-                            match = re.search(
-                                r"_cl(\d+)\.onnx$", onnx_path
-                            )
-                            if match:
-                                detected_cl = int(match.group(1))
-                                print()
-                                print(
-                                    f"Requested context_length={context_length} not found in checkpoint. "
-                                    f"Using available context_length={detected_cl} from {os.path.basename(onnx_path)}."
-                                )
-                                context_length = detected_cl
-
             if not onnx_file_exists:
                 if fp_model is None:
                     raise ValueError(
                         "The quantized checkpoint (with custom weights) must have an ONNX model."
                     )
-                onnx_export_input_spec = cls.get_onnx_export_input_spec(
-                    llm_config=fp_model.llm_config.to_dict(),
-                    sequence_length=sequence_length,
-                    context_length=context_length,
-                    llm_io_type=fp_model.llm_io_type,
-                )
-                onnx_export_output_names = cls.get_onnx_export_output_names(
-                    llm_config=fp_model.llm_config.to_dict(),
-                    sequence_length=sequence_length,
-                    context_length=context_length,
-                    llm_io_type=fp_model.llm_io_type,
-                )
+                # Floating model is created if not passed when from_pretrained() is called and an ONNX model doesn't exist.
                 onnx_model = get_onnx_model(
                     fp_model=fp_model,
                     context_length=context_length,
@@ -1970,8 +1810,6 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
                     return_model=True,
                     llm_io_type=fp_model.llm_io_type,
                     use_dynamic_shapes=use_dynamic_shapes,
-                    input_spec=onnx_export_input_spec,
-                    output_names=onnx_export_output_names,
                 )
 
             else:
@@ -2018,8 +1856,7 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
                     print(
                         f"Loading the encodings from path {checkpoint} to load the QuantSim model."
                     )
-                    _fix_unsupported_channel_axis(quant_sim)
-                    _load_encodings_with_fallback(quant_sim, aimet_encodings)
+                    load_encodings_to_sim(quant_sim, aimet_encodings, strict=False)
         else:
             quant_sim = None
 
@@ -2079,13 +1916,40 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
 
         AimetLogger.set_level_for_all_areas(logging.WARNING)
         default_config = get_aimet_config_path("default_config_llama")
+
+        # Map undefined tensor type (0) to float16 so AIMET's
+        # _infer_activation_dtypes doesn't crash on dynamo-exported models
+        # where shape inference can't resolve all intermediate types
+        if 0 not in onnx.mapping.TENSOR_TYPE_MAP:
+            onnx.mapping.TENSOR_TYPE_MAP[0] = onnx.mapping.TENSOR_TYPE_MAP[
+                onnx.TensorProto.FLOAT16
+            ]
+
         # Tie Quantizers for Concat Op
         quantsim.op_types_to_tie_qtzrs = ["Concat"]
         quantsim._tie_qtzrs = True
         # Ignore Slice and Constant outputs
         quantsim.op_outputs_to_ignore.append("Slice")
         quantsim.op_outputs_to_ignore.append("Constant")
+        # Ignore sequence-producing ops (dynamo export without full optimization)
+        quantsim.op_outputs_to_ignore.append("SplitToSequence")
+        quantsim.op_outputs_to_ignore.append("SequenceAt")
+        quantsim.op_outputs_to_ignore.append("SequenceConstruct")
         qs.encoding_version = "1.0.0"
+
+        # Ensure opset_import is present (dynamo export with optimize=False
+        # may omit it, causing onnxruntime to reject the model)
+        has_default_opset = any(
+            op.domain == "" and op.version > 0
+            for op in onnx_model.opset_import
+        )
+        if not has_default_opset:
+            del onnx_model.opset_import[:]
+            opset = onnx_model.opset_import.add()
+            opset.domain = ""
+            opset.version = 18
+        if onnx_model.ir_version == 0:
+            onnx_model.ir_version = 9
 
         quant_sim = QuantizationSimModel(
             model=onnx_model,
@@ -2236,19 +2100,6 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
         external_weights_file = os.path.join(checkpoint, "model.data")
         onnx_file = os.path.join(checkpoint, "model.onnx")
 
-        onnx_export_input_spec = cls.get_onnx_export_input_spec(
-            llm_config=fp_model.llm_config.to_dict(),
-            sequence_length=DEFAULT_SEQUENCE_LENGTH if use_dynamic_shapes else (export_sequence_lengths[0] if export_sequence_lengths else DEFAULT_SEQUENCE_LENGTH),
-            context_length=context_length,
-            llm_io_type=llm_io_type,
-        )
-        onnx_export_output_names = cls.get_onnx_export_output_names(
-            llm_config=fp_model.llm_config.to_dict(),
-            sequence_length=DEFAULT_SEQUENCE_LENGTH if use_dynamic_shapes else (export_sequence_lengths[0] if export_sequence_lengths else DEFAULT_SEQUENCE_LENGTH),
-            context_length=context_length,
-            llm_io_type=llm_io_type,
-        )
-
         if use_dynamic_shapes:
             # Dynamic: single model_dynamic.onnx
             dynamic_onnx_model = os.path.join(checkpoint, "model_dynamic.onnx")
@@ -2262,8 +2113,6 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
                     path=onnx_file,
                     llm_io_type=llm_io_type,
                     use_dynamic_shapes=True,
-                    input_spec=onnx_export_input_spec,
-                    output_names=onnx_export_output_names,
                 )
                 shutil.move(onnx_file, dynamic_onnx_model)
         elif export_sequence_lengths is not None:
@@ -2275,29 +2124,12 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
                 if not os.path.exists(expected_onnx_model) or not os.path.exists(
                     external_weights_file
                 ):
-                    seq_input_spec = None
-                    seq_output_names = None
-                    if onnx_export_input_spec is not None:
-                        seq_input_spec = cls.get_onnx_export_input_spec(
-                            llm_config=fp_model.llm_config.to_dict(),
-                            sequence_length=seq_len,
-                            context_length=context_length,
-                            llm_io_type=llm_io_type,
-                        )
-                        seq_output_names = cls.get_onnx_export_output_names(
-                            llm_config=fp_model.llm_config.to_dict(),
-                            sequence_length=seq_len,
-                            context_length=context_length,
-                            llm_io_type=llm_io_type,
-                        )
                     get_onnx_model(
                         fp_model=fp_model,
                         context_length=context_length,
                         sequence_length=seq_len,
                         path=onnx_file,
                         llm_io_type=llm_io_type,
-                        input_spec=seq_input_spec,
-                        output_names=seq_output_names,
                     )
                     shutil.move(onnx_file, expected_onnx_model)
 
@@ -2441,14 +2273,6 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
         )
         dataloader = DataLoader(dataset, batch_size=1, collate_fn=dataset.collate_fn)
 
-        input_spec = self.get_input_spec(
-            llm_config=self.llm_config.to_dict(),
-            sequence_length=self.sequence_length,
-            context_length=self.context_length,
-            llm_io_type=self.llm_io_type,
-        )
-        assert input_spec is not None
-
         assert self.EmbeddingClass is not None
         rope_embeddings = self.EmbeddingClass(
             max_length=self.context_length, config=self.llm_config
@@ -2459,25 +2283,27 @@ class LLM_AIMETOnnx(AIMETOnnxQuantizableMixin, LLMConfigEditor, BaseModel, ABC):
             rope_embeddings,
         )
 
+        # Dynamically allocate input slots based on what prefill actually
+        # produces, which matches the ONNX session's input count.
+        inputs: list[list[torch.Tensor | np.ndarray]] | None = None
+
+        # Only bother removing quantization if we don't have a floating point model provided
         with self.remove_quantization():
-            first_sample = True
+            # for data in dataloader
             for sample in tqdm(
                 dataloader, total=len(dataloader), desc="Pre-filling calibration data"
             ):
                 input_ids, attention_mask, _ = sample
                 for prefilled_inputs in generator.prefill(input_ids, attention_mask):
-                    if first_sample:
-                        inputs: list[list[torch.Tensor | np.ndarray]] = [
-                            [] for _ in range(len(prefilled_inputs))
-                        ]
-                        input_names = [
-                            k for k in input_spec
-                            if not k.startswith("conv_state_") and not k.startswith("recurrent_state_")
-                        ]
-                        first_sample = False
+                    if inputs is None:
+                        inputs = [[] for _ in range(len(prefilled_inputs))]
                     for i, tensor in enumerate(prefilled_inputs):
                         inputs[i].append(tensor)
 
+        assert inputs is not None
+        # Use the ONNX session's input names which match positional order
+        assert self.quant_sim is not None
+        input_names = [inp.name for inp in self.quant_sim.session.get_inputs()]
         return make_hub_dataset_entries(tuple(inputs), input_names)
 
     def get_evaluator(

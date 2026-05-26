@@ -17,14 +17,17 @@ from qai_hub_models.models._shared.llm.model import (
 
 # isort: on
 import copy
+import functools
 import json
 import logging
+import math
 import os
 from collections.abc import Collection
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import onnx
 import torch
 
@@ -33,6 +36,7 @@ if TYPE_CHECKING:
 
 import qai_hub as hub
 from packaging.version import Version
+from qai_hub.client import DatasetEntries
 from transformers import PretrainedConfig, PreTrainedTokenizer
 from transformers.cache_utils import DynamicCache
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
@@ -138,6 +142,7 @@ class Qwen3_5Base(LLMBase):
     LMClass = modeling_qwen3_5.Qwen3_5ForCausalLM
     EmbeddingClass = Qwen3_5RopeEmbedding
     llm_io_type = LLMIOType.genie_input_embeds
+    _linear_attn_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
     default_user_prompt = "What is gravity? Keep the answer under ten words."
     default_system_prompt = "You are a helpful AI assistant."
@@ -295,8 +300,9 @@ class Qwen3_5Base(LLMBase):
             )
 
         if kv_only_mode:
-            if state_tensors[0].abs().sum() == 0:
-                self._linear_attn_cache.clear()
+            if not torch.compiler.is_compiling():
+                if state_tensors[0].abs().sum() == 0:
+                    self._linear_attn_cache.clear()
 
         cache = DynamicCache(config=text_config)
 
@@ -366,7 +372,8 @@ class Qwen3_5Base(LLMBase):
         flat_output_states: list[torch.Tensor] = []
 
         if kv_only_mode:
-            self._linear_attn_cache.clear()
+            if not torch.compiler.is_compiling():
+                self._linear_attn_cache.clear()
 
         for layer_idx, layer_type in enumerate(layer_types):
             if layer_type == "full_attention":
@@ -387,10 +394,11 @@ class Qwen3_5Base(LLMBase):
                 recurrent_state_out = layer_cache.recurrent_states
 
                 if kv_only_mode:
-                    self._linear_attn_cache[layer_idx] = (
-                        conv_state_out.detach(),
-                        recurrent_state_out.detach(),
-                    )
+                    if not torch.compiler.is_compiling():
+                        self._linear_attn_cache[layer_idx] = (
+                            conv_state_out.detach(),
+                            recurrent_state_out.detach(),
+                        )
                 else:
                     flat_output_states.append(conv_state_out)
                     flat_output_states.append(recurrent_state_out)
@@ -579,6 +587,108 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
             attention_mask_multiplier=attention_mask_multiplier,
         )
         self._linear_attn_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._disable_gate_weight_quantizers()
+        self._disable_activation_quantizers()
+        self._convert_weights_to_int8()
+
+    def _disable_gate_weight_quantizers(self) -> None:
+        """Disable quantization for GatedDeltaNet gate projection weights.
+
+        The in_proj_a and in_proj_b weights control recurrent state decay
+        gates via exp(-A * softplus(a)) and update gates via sigmoid(b).
+        INT4 quantization noise in these projections gets amplified
+        exponentially through the recurrent sequence processing, causing
+        catastrophic model degradation. Keeping these tiny weights
+        (~0.07% of total params) at full precision eliminates this issue.
+        """
+        if self.quant_sim is None:
+            return
+        disabled = 0
+        for name, qc_op in self.quant_sim.qc_quantize_op_dict.items():
+            if name in self.quant_sim.activation_names:
+                continue
+            if "in_proj_a" in name or "in_proj_b" in name:
+                qc_op.enabled = False
+                disabled += 1
+        if disabled > 0:
+            print(f"Disabled {disabled} gate weight quantizers (in_proj_a/b)")
+
+    def _disable_activation_quantizers(self) -> None:
+        """Disable all activation quantizers to achieve true W4A16 behavior.
+
+        The checkpoint contains both INT16 (~5780) and INT8 (~252)
+        activation quantizers. The INT16 ones cause catastrophic PPL
+        degradation due to coarse quantization steps. The INT8 ones
+        quantize intermediate attention computations (mul, div, add, sub,
+        cat, conv2d, past_key/value) and add additional noise.
+
+        For W4A16 evaluation, all activations should pass through at
+        full precision while only weights remain INT4 quantized.
+        """
+        if self.quant_sim is None:
+            return
+
+        disabled_16 = 0
+        disabled_8 = 0
+        for name, qc_op in self.quant_sim.qc_quantize_op_dict.items():
+            if name not in self.quant_sim.activation_names:
+                continue
+            if not qc_op.enabled:
+                continue
+            if qc_op.bitwidth == 16:
+                qc_op.enabled = False
+                disabled_16 += 1
+            elif qc_op.bitwidth == 8:
+                qc_op.enabled = False
+                disabled_8 += 1
+        if disabled_16 > 0 or disabled_8 > 0:
+            print(
+                f"Disabled {disabled_16} INT16 + {disabled_8} INT8 activation quantizers"
+            )
+
+    def _convert_weights_to_int8(self) -> None:
+        """Convert INT4 weight quantizers to INT8 with fresh calibration.
+
+        Uses AIMET's compute_encodings to re-calibrate weight quantizers
+        at INT8 precision. Preserves original block_size=32.
+        """
+        if self.quant_sim is None:
+            return
+
+        from aimet_onnx.quantsim import compute_encodings
+
+        converted = 0
+        for name, qc_op in self.quant_sim.qc_quantize_op_dict.items():
+            if name in self.quant_sim.activation_names:
+                continue
+            if not qc_op.enabled:
+                continue
+            if qc_op.bitwidth == 4:
+                qc_op.set_bitwidth(8)
+                converted += 1
+
+        if converted == 0:
+            return
+
+        print(f"Re-calibrating {converted} weight quantizers at INT8...")
+
+        # Create dummy inputs for a single forward pass
+        session = self.quant_sim.session
+        dummy_inputs = {}
+        for inp in session.get_inputs():
+            shape = [1 if isinstance(s, str) or s is None else s for s in inp.shape]
+            if "int" in inp.type.lower():
+                dummy_inputs[inp.name] = np.ones(shape, dtype=np.int64)
+            else:
+                dummy_inputs[inp.name] = np.zeros(shape, dtype=np.float32)
+
+        # compute_encodings will: reset stats, set weight ops to
+        # oneShotQuantizeDequantize mode, run forward pass (which feeds
+        # weight tensors through quantizers), then compute fresh encodings.
+        with compute_encodings(self.quant_sim):
+            self.quant_sim.session.run(None, dummy_inputs)
+
+        print(f"Re-calibrated {converted} weight quantizers from INT4 to INT8")
 
     def _get_layer_types(self) -> list[str]:
         if hasattr(self.llm_config, "text_config"):
@@ -592,6 +702,48 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
             return self.llm_config.text_config
         return self.llm_config
 
+    @functools.cache
+    def _get_embedding_table(self) -> torch.nn.Embedding:
+        """Override to handle dynamo-exported ONNX where lm_head weight
+        is used via Gather (embedding) + Transpose->MatMul (lm_head)."""
+        if self.quant_sim is None:
+            raise RuntimeError(
+                "Cannot get embedding table from LLM object created with _skip_quantsim_creation=True"
+            )
+        from aimet_onnx.quantsim import QuantizationSimModel
+        assert isinstance(self.quant_sim, QuantizationSimModel)
+        model = self.quant_sim.model.model
+        text_config = self._get_text_config()
+
+        # Find the embedding/lm_head weight by name pattern
+        for weight in model.graph.initializer:
+            if "lm_head" in weight.name or "embed_tokens" in weight.name:
+                embedding_table = torch.from_numpy(
+                    onnx.numpy_helper.to_array(weight).copy()
+                )
+                # The weight may be (vocab_size, hidden_size) - use as-is
+                return torch.nn.Embedding(
+                    embedding_table.shape[0],
+                    embedding_table.shape[1],
+                    getattr(text_config, "pad_token_id", None),
+                    _weight=embedding_table,
+                )
+
+        # Fallback: find by vocab_size from config
+        vocab_size = text_config.vocab_size
+        for weight in model.graph.initializer:
+            if any(dim == vocab_size for dim in weight.dims):
+                embedding_table = torch.from_numpy(
+                    onnx.numpy_helper.to_array(weight).copy()
+                )
+                return torch.nn.Embedding(
+                    text_config.vocab_size,
+                    text_config.hidden_size,
+                    getattr(text_config, "pad_token_id", None),
+                    _weight=embedding_table,
+                )
+        raise RuntimeError("Unable to find embedding table in ONNX model.")
+
     def _get_linear_attn_config(self) -> dict[str, int]:
         text_config = self._get_text_config()
         return {
@@ -601,6 +753,146 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
             "linear_num_key_heads": getattr(text_config, "linear_num_key_heads", 16),
             "linear_num_value_heads": getattr(text_config, "linear_num_value_heads", 16),
         }
+
+    def get_calibration_data(
+        self,
+        num_samples: int = 0,
+        input_spec: InputSpec | None = None,
+    ) -> DatasetEntries | None:
+        """Override to handle hybrid model inputs.
+
+        The generator produces KV-only calibration data (base + past_key/value),
+        but the ONNX model expects hybrid inputs (base + all state tensors
+        including conv_state/recurrent_state for linear_attention layers).
+        This override remaps generator outputs to the full ONNX input format
+        using name-based matching.
+        """
+        from qai_hub_models.models._shared.llm.generator import LLM_Generator
+        from qai_hub_models.datasets.common import DatasetSplit
+        from qai_hub_models.datasets import get_dataset_from_name
+        from qai_hub_models.utils.qai_hub_helpers import make_hub_dataset_entries
+        from torch.utils.data import DataLoader
+        from tqdm import tqdm
+
+        if num_samples == 0:
+            num_samples = math.ceil(80000 / self.context_length)
+
+        dataset = get_dataset_from_name(
+            name="wikitext",
+            split=DatasetSplit.TRAIN,
+            tokenizer=self.tokenizer,
+            block_size=self.sequence_length,
+            context_length=self.context_length,
+            num_samples=num_samples,
+        )
+        dataloader = DataLoader(dataset, batch_size=1, collate_fn=dataset.collate_fn)
+
+        assert self.EmbeddingClass is not None
+        rope_embeddings = self.EmbeddingClass(
+            max_length=self.context_length, config=self.llm_config
+        )
+        generator = LLM_Generator(
+            [self],
+            self.tokenizer,
+            rope_embeddings,
+        )
+
+        # Get ONNX session input info (names + shapes)
+        assert self.quant_sim is not None
+        onnx_inputs = self.quant_sim.session.get_inputs()
+        input_names = [inp.name for inp in onnx_inputs]
+        input_shapes = {
+            inp.name: tuple(d if isinstance(d, int) else 1 for d in inp.shape)
+            for inp in onnx_inputs
+        }
+
+        # Get the model's input spec to determine the order the generator
+        # produces base inputs and KV tensors
+        model_input_spec = self.get_input_spec(
+            llm_config=self.llm_config.to_dict(),
+            sequence_length=self.sequence_length,
+            context_length=self.context_length,
+            llm_io_type=self.llm_io_type,
+        )
+
+        # Names in the order the generator produces them
+        generator_base_names = [
+            k for k in model_input_spec.keys()
+            if not (k.startswith("past_") or k.startswith("conv_state_") or k.startswith("recurrent_state_"))
+        ]
+        generator_kv_names = [
+            k for k in model_input_spec.keys()
+            if k.startswith("past_")
+        ]
+
+        # Build calibration data by name
+        inputs_by_name: dict[str, list[torch.Tensor]] = {name: [] for name in input_names}
+
+        with self.remove_quantization():
+            for sample in tqdm(
+                dataloader, total=len(dataloader), desc="Pre-filling calibration data"
+            ):
+                input_ids, attention_mask, _ = sample
+                for prefilled_inputs in generator.prefill(input_ids, attention_mask):
+                    base_tensors = prefilled_inputs[:len(generator_base_names)]
+                    kv_tensors = prefilled_inputs[len(generator_base_names):]
+
+                    # Assign base inputs by name
+                    for name, tensor in zip(generator_base_names, base_tensors):
+                        inputs_by_name[name].append(tensor)
+
+                    # Assign KV cache tensors by name
+                    for name, tensor in zip(generator_kv_names, kv_tensors):
+                        inputs_by_name[name].append(tensor)
+
+                    # Fill conv_state/recurrent_state with zeros
+                    for name in input_names:
+                        if name.startswith("conv_state_") or name.startswith("recurrent_state_"):
+                            inputs_by_name[name].append(
+                                torch.zeros(input_shapes[name])
+                            )
+
+        # Convert to tuple in session input order for make_hub_dataset_entries
+        inputs_tuple = tuple(inputs_by_name[name] for name in input_names)
+        # Store the input names so _dataloader_to_numpy can do name-based mapping
+        self._calib_input_names = input_names
+        return make_hub_dataset_entries(inputs_tuple, input_names)
+
+    def _dataloader_to_numpy(
+        self, data: Any, num_batches: int
+    ) -> list[dict[str, Any]]:
+        """Override to use name-based mapping instead of positional.
+
+        The base class maps DataLoader batch tuples to session input names
+        positionally. If the DatasetEntries key order differs from the session
+        input order (e.g., due to dict sorting), this causes shape mismatches.
+        This override reads the actual key order from the underlying dataset
+        to correctly map batch positions to input names.
+        """
+        import itertools
+        from tqdm import tqdm
+
+        assert self.quant_sim is not None
+        session_input_names = [
+            inp.name for inp in self.quant_sim.session.get_inputs()
+        ]
+        # Get the actual key order from the underlying CustomDataset
+        # This is the order __getitem__ iterates when building the batch tuple
+        dataset_key_order = list(data.dataset.data_entries.keys())
+
+        onnx_data = []
+        n = min(len(data), num_batches)
+        for batch in tqdm(itertools.islice(data, n), total=n):
+            # Map batch positions to their actual names from the dataset
+            batch_dict = {
+                name: tensor.cpu().detach().numpy()
+                for name, tensor in zip(dataset_key_order, batch)
+            }
+            # Build dict in session input order
+            onnx_data.append(
+                {name: batch_dict[name] for name in session_input_names}
+            )
+        return onnx_data
 
     @staticmethod
     def _get_output_names(
@@ -648,7 +940,17 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
         quantsim._tie_qtzrs = True
         quantsim.op_outputs_to_ignore.append("Slice")
         quantsim.op_outputs_to_ignore.append("Constant")
+        quantsim.op_outputs_to_ignore.append("SplitToSequence")
+        quantsim.op_outputs_to_ignore.append("SequenceAt")
+        quantsim.op_outputs_to_ignore.append("SequenceConstruct")
         qs.encoding_version = "1.0.0"
+
+        # Map undefined tensor type (0) to float16 so AIMET's
+        # _infer_activation_dtypes doesn't crash on dynamo-exported models
+        if 0 not in onnx.mapping.TENSOR_TYPE_MAP:
+            onnx.mapping.TENSOR_TYPE_MAP[0] = onnx.mapping.TENSOR_TYPE_MAP[
+                onnx.TensorProto.FLOAT16
+            ]
 
         if precision == Precision.w8a16:
             param_type = "int8"
@@ -730,50 +1032,6 @@ class Qwen3_5Base_AIMETOnnx(LLM_AIMETOnnx):
             symmetric=True,
             block_size=block_size,
         )
-
-    def _dataloader_to_numpy(
-        self, data, num_batches: int
-    ) -> list[dict[str, Any]]:
-        import numpy as np
-        from tqdm import tqdm
-        import itertools
-        from qai_hub_models.utils.runtime_torch_wrapper import kwargs_to_dict
-
-        assert self.quant_sim is not None
-        session = self.quant_sim.session
-        input_infos = {
-            inp.name: inp
-            for inp in session.get_inputs()
-        }
-        input_names = list(input_infos.keys())
-
-        mamba_state_inputs = {
-            name for name in input_names
-            if "conv_state" in name or "recurrent_state" in name
-        }
-        non_mamba_names = [n for n in input_names if n not in mamba_state_inputs]
-
-        mamba_state_shapes = {}
-        for name in mamba_state_inputs:
-            mamba_state_shapes[name] = [
-                d if isinstance(d, int) else 1 for d in input_infos[name].shape
-            ]
-
-        onnx_data = []
-        n = min(len(data), num_batches)
-        for batch in tqdm(itertools.islice(data, n), total=n):
-            batch_list = list(batch)
-            provided = kwargs_to_dict(non_mamba_names, *batch_list)
-
-            entry: dict[str, Any] = {}
-            for name in input_names:
-                if name in mamba_state_inputs:
-                    entry[name] = np.zeros(mamba_state_shapes[name], dtype=np.float32)
-                else:
-                    entry[name] = provided[name].cpu().detach().numpy()
-
-            onnx_data.append(entry)
-        return onnx_data
 
     @classmethod
     def prepare_genie_assets(

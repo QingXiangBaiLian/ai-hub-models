@@ -44,6 +44,7 @@ def qwen3_5_0_8b_chat_demo(
         supported_precisions=SUPPORTED_PRECISIONS,
         default_prompt=default_prompt,
         test_checkpoint=test_checkpoint,
+        supports_thinking=True,
     )
 
 

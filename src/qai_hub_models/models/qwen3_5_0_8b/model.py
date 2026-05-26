@@ -157,8 +157,12 @@ class Qwen3_5_0_8B(Qwen3_5Base):
         )
 
     @staticmethod
+    def _get_output_names(num_hidden_layers: int) -> list[str]:  # type: ignore[override]
+        return Qwen3_5Base._get_output_names(num_hidden_layers, LAYER_TYPES)
+
+    @staticmethod
     def get_output_names() -> list[str]:
-        return Qwen3_5Base._get_output_names(NUM_LAYERS, LAYER_TYPES, kv_only=True)
+        return Qwen3_5Base._get_output_names(NUM_LAYERS, LAYER_TYPES)
 
     @staticmethod
     def get_input_spec(
@@ -188,7 +192,6 @@ class Qwen3_5_0_8B(Qwen3_5Base):
                 llm_config.get("rope_parameters", {}).get("partial_rotary_factor", 0.25),
             ),
             llm_io_type=llm_io_type,
-            kv_only=True,
         )
 
 
